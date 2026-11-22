@@ -1,0 +1,14 @@
+[package]
+name = "libuvc-sys"
+version = "0.1.0"
+edition = "2021"
+description = "Raw FFI to a vendored, Windows-patched libuvc (static), linked against vendored libusb"
+license = "BSD-3-Clause"
+links = "uvc"
+build = "build.rs"
+
+[dependencies]
+libusb1-sys = { version = "0.7", features = ["vendored"] }
+
+[build-dependencies]
+cc = "1"
