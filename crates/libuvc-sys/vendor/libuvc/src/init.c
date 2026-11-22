@@ -136,11 +136,17 @@ uvc_error_t uvc_init(uvc_context_t **pctx, struct libusb_context *usb_ctx) {
  * @param ctx UVC context to shut down
  */
 void uvc_exit(uvc_context_t *ctx) {
-  uvc_device_handle_t *devh;
+  uvc_device_handle_t *devh, *devh_tmp;
 
-  DL_FOREACH(ctx->open_devices, devh) {
+  /* ThermalView patch: _SAFE because uvc_close unlinks devh. */
+  DL_FOREACH_SAFE(ctx->open_devices, devh, devh_tmp) {
     uvc_close(devh);
   }
+
+  /* ThermalView patch: a handle with stuck transfers stays open (see uvc_close), and the event
+     thread still serves it, so the libusb context cannot be torn down. */
+  if (ctx->open_devices != NULL)
+    return;
 
   if (ctx->own_usb_ctx)
     libusb_exit(ctx->usb_ctx);
@@ -157,6 +163,10 @@ void uvc_exit(uvc_context_t *ctx) {
  * are already open (and being handled).
  */
 void uvc_start_handler_thread(uvc_context_t *ctx) {
+  /* ThermalView patch: uvc_close sets this flag and upstream never cleared it, so after closing
+     the last device, a reopen in the same context got an event thread that exited at once: no
+     frames arrived and no transfer ever completed or cancelled. */
+  ctx->kill_handler_thread = 0;
   if (ctx->own_usb_ctx)
     pthread_create(&ctx->handler_thread, NULL, _uvc_handle_events, (void*) ctx);
 }

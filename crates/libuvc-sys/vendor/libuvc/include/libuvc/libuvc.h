@@ -555,6 +555,8 @@ uvc_error_t uvc_start_iso_streaming(
     void *user_ptr);
 
 void uvc_stop_streaming(uvc_device_handle_t *devh);
+/* ThermalView patch: nonzero if a stop gave up on transfers still held by the OS. */
+int uvc_has_stuck_transfers(uvc_device_handle_t *devh);
 
 uvc_error_t uvc_stream_open_ctrl(uvc_device_handle_t *devh, uvc_stream_handle_t **strmh, uvc_stream_ctrl_t *ctrl);
 uvc_error_t uvc_stream_ctrl(uvc_stream_handle_t *strmh, uvc_stream_ctrl_t *ctrl);

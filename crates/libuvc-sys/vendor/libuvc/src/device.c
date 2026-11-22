@@ -96,6 +96,15 @@ uvc_error_t uvc_parse_vs_input_header(uvc_streaming_interface_t *stream_if,
 
 void LIBUSB_CALL _uvc_status_callback(struct libusb_transfer *transfer);
 
+/* ThermalView patch: short sleep for the cancel-and-wait in uvc_close. */
+#ifdef _WIN32
+#include <windows.h>
+static void _uvc_sleep_ms(unsigned ms) { Sleep(ms); }
+#else
+#include <unistd.h>
+static void _uvc_sleep_ms(unsigned ms) { usleep(ms * 1000); }
+#endif
+
 /** @internal
  * @brief Test whether the specified USB device has been opened as a UVC device
  * @ingroup device
@@ -322,10 +331,13 @@ uvc_error_t uvc_open(
                                    _uvc_status_callback,
                                    internal_devh,
                                    0);
+    /* ThermalView patch: set before submitting, the callback may run immediately. */
+    internal_devh->status_xfer_active = 1;
     ret = libusb_submit_transfer(internal_devh->status_xfer);
     UVC_DEBUG("libusb_submit_transfer() = %d", ret);
 
     if (ret) {
+      internal_devh->status_xfer_active = 0;
       fprintf(stderr,
               "uvc: device has a status interrupt endpoint, but unable to read from it\n");
       goto fail;
@@ -1504,6 +1516,30 @@ void uvc_close(uvc_device_handle_t *devh) {
   if (devh->streams)
     uvc_stop_streaming(devh);
 
+  /* ThermalView patch: upstream closed with the status interrupt transfer (no timeout) still in
+     flight, and its completion then wrote into the freed devh. Cancel it and wait for the event
+     thread to finish it; cancelling repeats in case a resubmit raced with the first attempt. */
+  devh->closing = 1;
+  if (devh->status_xfer) {
+    int waited_ms;
+    for (waited_ms = 0; devh->status_xfer_active && waited_ms < 2000; waited_ms += 5) {
+      if (waited_ms % 100 == 0)
+        libusb_cancel_transfer(devh->status_xfer);
+      _uvc_sleep_ms(5);
+    }
+    if (devh->status_xfer_active) {
+      fprintf(stderr, "libuvc: status transfer did not finish; keeping the device handle open\n");
+      devh->stuck_transfers = 1;
+    }
+  }
+
+  /* ThermalView patch: with transfers still in flight, libusb_close leaves them pointing at freed
+     backend state and the next completion crashes. Keep the handle; the OS reclaims it at exit. */
+  if (devh->stuck_transfers) {
+    UVC_EXIT_VOID();
+    return;
+  }
+
   uvc_release_if(devh, devh->info->ctrl_if.bInterfaceNumber);
 
   /* If we are managing the libusb context and this is the last open device,
@@ -1690,10 +1726,12 @@ void LIBUSB_CALL _uvc_status_callback(struct libusb_transfer *transfer) {
   case LIBUSB_TRANSFER_CANCELLED:
   case LIBUSB_TRANSFER_NO_DEVICE:
     UVC_DEBUG("not processing/resubmitting, status = %d", transfer->status);
+    devh->status_xfer_active = 0;
     UVC_EXIT_VOID();
     return;
   case LIBUSB_TRANSFER_COMPLETED:
-    uvc_process_status_xfer(devh, transfer);
+    if (!devh->closing)
+      uvc_process_status_xfer(devh, transfer);
     break;
   case LIBUSB_TRANSFER_TIMED_OUT:
   case LIBUSB_TRANSFER_STALL:
@@ -1702,8 +1740,18 @@ void LIBUSB_CALL _uvc_status_callback(struct libusb_transfer *transfer) {
     break;
   }
 
+  /* ThermalView patch: devh is freed once status_xfer_active drops to 0, so this must be the
+     last access to it on every path. */
+  if (devh->closing) {
+    devh->status_xfer_active = 0;
+    UVC_EXIT_VOID();
+    return;
+  }
+
   uvc_error_t ret = libusb_submit_transfer(transfer);
   UVC_DEBUG("libusb_submit_transfer() = %d", ret);
+  if (ret != LIBUSB_SUCCESS)
+    devh->status_xfer_active = 0;
 
   UVC_EXIT_VOID();
 }

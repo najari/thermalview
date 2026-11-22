@@ -14,6 +14,7 @@ cargo build --release
 .\target\release\thermalview.exe          # 앱
 cargo run --release --example grab        # 수신 속도 확인
 cargo run --release --example soak 60     # 60분 연속 동작 시험
+cargo run --release --example churn 150   # 열기·수신·닫기 반복 시험
 ```
 
 기능(MVP): 실시간 열화상, 팔레트 5종, 자동/수동 눈금, 최고·최저 표시, Spot 측정(최대 16개),

@@ -46,7 +46,10 @@
 
 #ifdef _MSC_VER
 
-#define DELTA_EPOCH_IN_MICROSECS  116444736000000000Ui64
+/* ThermalView patch: upstream had 116444736000000000, which is the 1601-to-1970 offset in 100 ns
+   units, but it is subtracted from microseconds below. The result was garbage, so every timed
+   wait (including "wait for cancelled transfers" in uvc_stream_stop) expired immediately. */
+#define DELTA_EPOCH_IN_MICROSECS  11644473600000000Ui64
 
 // gettimeofday - get time of day for Windows;
 // A gettimeofday implementation for Microsoft Windows;
@@ -594,6 +597,12 @@ void _uvc_process_payload(uvc_stream_handle_t *strmh, uint8_t *payload, size_t p
   }
 
   if (data_len > 0) {
+    /* ThermalView patch: upstream copies without a bound. A device that stops sending EOF/FID
+       toggles would run off the end of outbuf. Drop the broken frame instead. */
+    if (strmh->got_bytes + data_len > LIBUVC_XFER_BUF_SIZE) {
+      strmh->got_bytes = 0;
+      return;
+    }
     memcpy(strmh->outbuf + strmh->got_bytes, payload + header_len, data_len);
     strmh->got_bytes += data_len;
 
@@ -612,10 +621,35 @@ void _uvc_process_payload(uvc_stream_handle_t *strmh, uint8_t *payload, size_t p
  *
  * @param transfer Active transfer
  */
+/* ThermalView patch: release a transfer that will not be resubmitted, and wake uvc_stream_stop. */
+static void _uvc_reap_transfer(uvc_stream_handle_t *strmh, struct libusb_transfer *transfer) {
+  int i;
+
+  pthread_mutex_lock(&strmh->cb_mutex);
+  for (i = 0; i < LIBUVC_NUM_TRANSFER_BUFS; i++) {
+    if (strmh->transfers[i] == transfer) {
+      free(transfer->buffer);
+      libusb_free_transfer(transfer);
+      strmh->transfers[i] = NULL;
+      break;
+    }
+  }
+  pthread_cond_broadcast(&strmh->cb_cond);
+  pthread_mutex_unlock(&strmh->cb_mutex);
+}
+
 void LIBUSB_CALL _uvc_stream_callback(struct libusb_transfer *transfer) {
   uvc_stream_handle_t *strmh = transfer->user_data;
 
   int resubmit = 1;
+
+  /* ThermalView patch: after stop, never touch the frame buffers or devh. They may already be
+     gone if cancelling timed out. Upstream also left a completed-but-not-resubmitted transfer in
+     the list forever, so stop always hit its timeout and freed buffers under live transfers. */
+  if (!strmh->running) {
+    _uvc_reap_transfer(strmh, transfer);
+    return;
+  }
 
   switch (transfer->status) {
   case LIBUSB_TRANSFER_COMPLETED:
@@ -655,32 +689,10 @@ void LIBUSB_CALL _uvc_stream_callback(struct libusb_transfer *transfer) {
     break;
   case LIBUSB_TRANSFER_CANCELLED:
   case LIBUSB_TRANSFER_ERROR:
-  case LIBUSB_TRANSFER_NO_DEVICE: {
-    int i;
+  case LIBUSB_TRANSFER_NO_DEVICE:
     UVC_DEBUG("not retrying transfer, status = %d", transfer->status);
-    pthread_mutex_lock(&strmh->cb_mutex);
-
-    /* Mark transfer as deleted. */
-    for(i=0; i < LIBUVC_NUM_TRANSFER_BUFS; i++) {
-      if(strmh->transfers[i] == transfer) {
-        UVC_DEBUG("Freeing transfer %d (%p)", i, transfer);
-        free(transfer->buffer);
-        libusb_free_transfer(transfer);
-        strmh->transfers[i] = NULL;
-        break;
-      }
-    }
-    if(i == LIBUVC_NUM_TRANSFER_BUFS ) {
-      UVC_DEBUG("transfer %p not found; not freeing!", transfer);
-    }
-
     resubmit = 0;
-
-    pthread_cond_broadcast(&strmh->cb_cond);
-    pthread_mutex_unlock(&strmh->cb_mutex);
-
     break;
-  }
   case LIBUSB_TRANSFER_TIMED_OUT:
   case LIBUSB_TRANSFER_STALL:
   case LIBUSB_TRANSFER_OVERFLOW:
@@ -688,8 +700,15 @@ void LIBUSB_CALL _uvc_stream_callback(struct libusb_transfer *transfer) {
     break;
   }
 
-  if ( strmh->running && resubmit )
-    libusb_submit_transfer(transfer);
+  /* ThermalView patch: decide under the lock so uvc_stream_stop either cancels this submission
+     or we see running == 0. A transfer that is not resubmitted is always reaped. */
+  if (resubmit) {
+    pthread_mutex_lock(&strmh->cb_mutex);
+    resubmit = strmh->running && libusb_submit_transfer(transfer) == LIBUSB_SUCCESS;
+    pthread_mutex_unlock(&strmh->cb_mutex);
+  }
+  if (!resubmit)
+    _uvc_reap_transfer(strmh, transfer);
 }
 
 /** Begin streaming video from the camera into the callback function.
@@ -1027,6 +1046,14 @@ uvc_error_t uvc_stream_start(
     ret = libusb_submit_transfer(strmh->transfers[transfer_id]);
     if (ret != UVC_SUCCESS) {
       UVC_DEBUG("libusb_submit_transfer failed");
+      /* ThermalView patch: the rest were never submitted, so no callback will free them. */
+      pthread_mutex_lock(&strmh->cb_mutex);
+      for (; transfer_id < LIBUVC_NUM_TRANSFER_BUFS; transfer_id++) {
+        free(strmh->transfers[transfer_id]->buffer);
+        libusb_free_transfer(strmh->transfers[transfer_id]);
+        strmh->transfers[transfer_id] = NULL;
+      }
+      pthread_mutex_unlock(&strmh->cb_mutex);
       break;
     }
   }
@@ -1067,6 +1094,7 @@ void *_uvc_user_caller(void *arg) {
   uvc_stream_handle_t *strmh = (uvc_stream_handle_t *) arg;
 
   uint32_t last_seq = 0;
+  int deliver;
 
   do {
     pthread_mutex_lock(&strmh->cb_mutex);
@@ -1083,10 +1111,14 @@ void *_uvc_user_caller(void *arg) {
     last_seq = strmh->hold_seq;
     _uvc_populate_frame(strmh);
 
+    /* ThermalView patch: evaluate under the lock. transfers[0] can be freed (NULL) at any time
+       once the stream is stopping. */
+    deliver = strmh->hold_bytes == strmh->cur_ctrl.dwMaxVideoFrameSize ||
+              (strmh->transfers[0] && strmh->transfers[0]->num_iso_packets == 0);
+
     pthread_mutex_unlock(&strmh->cb_mutex);
 
-    if (strmh->hold_bytes == strmh->cur_ctrl.dwMaxVideoFrameSize ||
-            strmh->transfers[0]->num_iso_packets == 0)
+    if (deliver)
         strmh->user_cb(&strmh->frame, strmh->user_ptr);
   } while(1);
 
@@ -1234,6 +1266,45 @@ void uvc_stop_streaming(uvc_device_handle_t *devh) {
   }
 }
 
+/* ThermalView patch: wait (cb_mutex held) until no transfer is outstanding.
+   Returns 1 if all are done, 0 on timeout. */
+static int _uvc_wait_transfers_done(uvc_stream_handle_t *strmh, int timeout_ms) {
+  struct timespec ts;
+  struct timeval tv;
+  int i, timed_out = 0;
+
+#if _POSIX_TIMERS > 0
+  clock_gettime(CLOCK_REALTIME, &ts);
+#else
+  gettimeofday(&tv, NULL);
+  ts.tv_sec = tv.tv_sec;
+  ts.tv_nsec = tv.tv_usec * 1000;
+#endif
+  ts.tv_sec += timeout_ms / 1000;
+  ts.tv_nsec += (timeout_ms % 1000) * 1000000L;
+  if (ts.tv_nsec >= 1000000000L) {
+    ts.tv_sec += 1;
+    ts.tv_nsec -= 1000000000L;
+  }
+
+  for (;;) {
+    for (i = 0; i < LIBUVC_NUM_TRANSFER_BUFS; i++) {
+      if (strmh->transfers[i] != NULL)
+        break;
+    }
+    if (i == LIBUVC_NUM_TRANSFER_BUFS)
+      return 1;
+    if (timed_out)
+      return 0;
+    timed_out = pthread_cond_timedwait(&strmh->cb_cond, &strmh->cb_mutex, &ts) == ETIMEDOUT;
+  }
+}
+
+/* ThermalView patch: true if a stop gave up on transfers that are still with the OS. */
+int uvc_has_stuck_transfers(uvc_device_handle_t *devh) {
+  return devh->stuck_transfers;
+}
+
 /** @brief Stop stream.
  * @ingroup streaming
  *
@@ -1242,61 +1313,43 @@ void uvc_stop_streaming(uvc_device_handle_t *devh) {
  * @param devh UVC device
  */
 uvc_error_t uvc_stream_stop(uvc_stream_handle_t *strmh) {
-  int i,timeout_us= 1000000,ret=UVC_SUCCESS;
-  time_t add_secs;
-  time_t add_nsecs;
-  struct timespec ts;
-  struct timeval tv;
+  int i, ret = UVC_SUCCESS, isochronous = 0;
+
   if (!strmh->running)
     return UVC_ERROR_INVALID_PARAM;
 
-  strmh->running = 0;
-
   pthread_mutex_lock(&strmh->cb_mutex);
 
-  for(i=0; i < LIBUVC_NUM_TRANSFER_BUFS; i++) {
-    if(strmh->transfers[i] != NULL) {
-      int res = libusb_cancel_transfer(strmh->transfers[i]);
-      if(res < 0 && res != LIBUSB_ERROR_NOT_FOUND ) {
-        free(strmh->transfers[i]->buffer);
-        libusb_free_transfer(strmh->transfers[i]);
-        strmh->transfers[i] = NULL;
-      }
+  /* ThermalView patch: cleared under the lock, see the resubmit in _uvc_stream_callback. */
+  strmh->running = 0;
+
+  for (i = 0; i < LIBUVC_NUM_TRANSFER_BUFS; i++) {
+    if (strmh->transfers[i] != NULL) {
+      isochronous = strmh->transfers[i]->num_iso_packets > 0;
+      break;
     }
   }
 
-  /* Wait for transfers to complete/cancel */
-  do {
-    for(i=0; i < LIBUVC_NUM_TRANSFER_BUFS; i++) {
-      if(strmh->transfers[i] != NULL)
-        break;
-    }
-    if(i == LIBUVC_NUM_TRANSFER_BUFS )
-      break;
-    // this ones sometimes does not return.
-    // pthread_cond_wait(&strmh->cb_cond, &strmh->cb_mutex);
-
-    add_secs = timeout_us / 1000000;
-    add_nsecs = (timeout_us % 1000000) * 1000;
-    ts.tv_sec = 0;
-    ts.tv_nsec = 0;
-
-#if _POSIX_TIMERS > 0
-    clock_gettime(CLOCK_REALTIME, &ts);
-#else
-    gettimeofday(&tv, NULL);
-    ts.tv_sec = tv.tv_sec;
-    ts.tv_nsec = tv.tv_usec * 1000;
-#endif
-
-    ts.tv_sec += add_secs;
-    ts.tv_nsec += add_nsecs;
-
-    if (ETIMEDOUT == pthread_cond_timedwait(&strmh->cb_cond, &strmh->cb_mutex, &ts)){
-      ret = UVC_ERROR_TIMEOUT;
-      break;
+  /* ThermalView patch: do not cancel isochronous transfers first. On WinUSB, libusb's
+     ContinueStream wrapper resubmits any transfer that did not succeed, including a cancelled
+     one, and ignores errors from that resubmit, so a cancel can lose the transfer for good.
+     Isochronous transfers finish on their own within milliseconds, and the callback reaps them
+     now that running == 0. Cancel only as a fallback (and always for bulk). A failed cancel
+     does not prove a transfer is idle, so nothing is freed here. */
+  if (!isochronous || !_uvc_wait_transfers_done(strmh, 1000)) {
+    for (i = 0; i < LIBUVC_NUM_TRANSFER_BUFS; i++) {
+      if (strmh->transfers[i] != NULL) {
+        int res = libusb_cancel_transfer(strmh->transfers[i]);
+        if (_uvc_trace_enabled())
+          fprintf(stderr, "[uvc-trace] cancel transfer %d -> %d (%s)\n", i, res, libusb_error_name(res));
       }
-  } while(1);
+    }
+    if (!_uvc_wait_transfers_done(strmh, 3000)) {
+      if (_uvc_trace_enabled())
+        fprintf(stderr, "[uvc-trace] stop timed out with transfers pending\n");
+      ret = UVC_ERROR_TIMEOUT;
+    }
+  }
   // Kick the user thread awake
   pthread_cond_broadcast(&strmh->cb_cond);
   pthread_mutex_unlock(&strmh->cb_mutex);
@@ -1320,10 +1373,30 @@ uvc_error_t uvc_stream_stop(uvc_stream_handle_t *strmh) {
  * @param strmh UVC stream handle
  */
 void uvc_stream_close(uvc_stream_handle_t *strmh) {
+  int i, pending = 0;
+
   if (strmh->running)
     uvc_stream_stop(strmh);
 
   uvc_release_if(strmh->devh, strmh->stream_if->bInterfaceNumber);
+
+  DL_DELETE(strmh->devh->streams, strmh);
+
+  /* ThermalView patch: upstream freed everything even when cancelled transfers were still in
+     flight, and their late callbacks then wrote into freed memory (heap corruption, crash).
+     If any transfer is still out, leak this stream (about 2 MiB): the callback only needs
+     strmh and its mutex, and reaps the transfer when it finally returns. */
+  pthread_mutex_lock(&strmh->cb_mutex);
+  for (i = 0; i < LIBUVC_NUM_TRANSFER_BUFS; i++) {
+    if (strmh->transfers[i] != NULL)
+      pending = 1;
+  }
+  pthread_mutex_unlock(&strmh->cb_mutex);
+  if (pending) {
+    fprintf(stderr, "libuvc: stream closed with transfers still pending; leaking its buffers\n");
+    strmh->devh->stuck_transfers = 1;
+    return;
+  }
 
   free(strmh->outbuf);
   free(strmh->holdbuf);
@@ -1331,6 +1404,5 @@ void uvc_stream_close(uvc_stream_handle_t *strmh) {
   pthread_cond_destroy(&strmh->cb_cond);
   pthread_mutex_destroy(&strmh->cb_mutex);
 
-  DL_DELETE(strmh->devh->streams, strmh);
   free(strmh);
 }

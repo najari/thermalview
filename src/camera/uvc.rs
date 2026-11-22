@@ -249,6 +249,13 @@ impl Handle {
         }
     }
 
+    /// True if stopping the stream gave up on USB transfers still held by the OS. The handle
+    /// then stays open until the process exits, and the device usually needs a replug.
+    pub fn has_stuck_transfers(&self) -> bool {
+        // SAFETY: devh is open for the lifetime of self; this only reads a flag.
+        unsafe { sys::uvc_has_stuck_transfers(self.devh) != 0 }
+    }
+
     /// UVC GET_CUR on an extension-unit control. Returns the number of bytes read.
     pub fn get_ctrl(&self, unit: u8, control: u8, buf: &mut [u8]) -> Result<usize, UvcError> {
         // SAFETY: devh is open; buf is valid for buf.len() bytes of writes.

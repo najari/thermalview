@@ -223,7 +223,9 @@ typedef struct uvc_device_info {
 #define LIBUVC_NUM_TRANSFER_BUFS 8
 #endif
 
-#define LIBUVC_XFER_BUF_SIZE	( 16 * 1024 * 1024 )
+/* ThermalView patch: 1 MiB instead of 16 MiB. A Lepton frame is at most 57,600 bytes, and a stream
+   whose transfers never finish cancelling is deliberately leaked (see uvc_stream_close). */
+#define LIBUVC_XFER_BUF_SIZE	( 1024 * 1024 )
 
 struct uvc_stream_handle {
   struct uvc_device_handle *devh;
@@ -277,6 +279,13 @@ struct uvc_device_handle {
   uvc_stream_handle_t *streams;
   /** Whether the camera is an iSight that sends one header per frame */
   uint8_t is_isight;
+  /** ThermalView patch: a stream was closed with transfers still in flight. libusb must not
+   *  close this handle then: a late completion would touch freed backend state. */
+  uint8_t stuck_transfers;
+  /** ThermalView patch: the status interrupt transfer is with libusb (cleared by its callback). */
+  volatile int status_xfer_active;
+  /** ThermalView patch: uvc_close is running, so the status transfer must not be resubmitted. */
+  volatile int closing;
 };
 
 /** Context within which we communicate with devices */

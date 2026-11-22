@@ -17,6 +17,8 @@ use crate::thermal::frame::{decode_le_u16, ThermalFrame};
 
 /// No frame for this long → the stream is considered stalled.
 const STALL_TIMEOUT: Duration = Duration::from_secs(2);
+/// Limit for the first frame after a stream start (the Lepton may still be booting).
+const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(8);
 /// Lepton status poll + shutter-mode re-apply (2 CCI commands; see the session loop).
 const STATUS_PERIOD: Duration = Duration::from_secs(5);
 const FPS_PERIOD: Duration = Duration::from_secs(1);
@@ -140,6 +142,11 @@ impl Camera {
             .unwrap_or_default()
     }
 
+    /// Exact count of good frames received so far (no USB traffic).
+    pub fn total_frames(&self) -> u64 {
+        self.shared.frames.load(Ordering::Relaxed)
+    }
+
     pub fn send(&self, cmd: Command) {
         let _ = self.tx.send(cmd);
     }
@@ -182,7 +189,10 @@ fn worker(shared: Arc<Shared>, rx: Receiver<Command>, mut desired: ShutterMode) 
                 });
             }
             Err(OpenError::Busy(e)) => shared.status(|s| {
-                s.state = ConnState::Busy;
+                // After stuck transfers this process itself still holds the device.
+                if s.state != ConnState::NeedsReplug {
+                    s.state = ConnState::Busy;
+                }
                 s.last_error = Some(e.to_string());
             }),
             Err(OpenError::Other(e)) => shared.status(|s| s.last_error = Some(e)),
@@ -289,14 +299,19 @@ fn session(
         s.last_error = None;
     });
 
+    let start_frames = shared.frames.load(Ordering::Relaxed);
     if let Err(e) = start_stream(&mut h, shared, scale) {
         shared.status(|s| s.last_error = Some(format!("스트리밍 시작 실패: {e}")));
         return false;
     }
-    shared.status(|s| s.state = ConnState::Streaming);
+    shared.status(|s| {
+        // "Streaming" is reported once a frame has really arrived.
+        if s.state != ConnState::NeedsReplug {
+            s.state = ConnState::Starting;
+        }
+    });
 
-    let start_frames = shared.frames.load(Ordering::Relaxed);
-    let mut restarted = false;
+    let mut streaming = false;
     let mut last_status = Instant::now() - STATUS_PERIOD;
     let mut fps_mark = (Instant::now(), shared.frames.load(Ordering::Relaxed));
 
@@ -315,28 +330,32 @@ fn session(
             }
         }
 
-        // Stall detection and recovery: restart the stream once, then reopen the device.
+        // Stall detection. Recovery closes and reopens the device, the teardown path that
+        // examples/churn exercises. A Lepton still booting gets a longer first-frame limit.
         let idle = shared.now_ms() - shared.last_frame_ms.load(Ordering::Relaxed);
-        if idle > STALL_TIMEOUT.as_millis() as u64 {
+        let got_frame = shared.frames.load(Ordering::Relaxed) > start_frames;
+        if got_frame && !streaming {
+            streaming = true;
             shared.status(|s| {
-                s.state = ConnState::Stalled;
+                s.state = ConnState::Streaming;
+                s.last_error = None;
+            });
+        }
+        let limit = if got_frame {
+            STALL_TIMEOUT
+        } else {
+            FIRST_FRAME_TIMEOUT
+        };
+        if idle > limit.as_millis() as u64 {
+            log::warn!("no frame for {idle} ms; reopening device");
+            shared.status(|s| {
+                if s.state != ConnState::NeedsReplug {
+                    s.state = ConnState::Stalled;
+                }
                 s.stalls += 1;
                 s.fps = 0.0;
             });
-            if restarted {
-                log::warn!("stream still stalled after restart; reopening device");
-                break;
-            }
-            log::warn!("stream stalled for {idle} ms; restarting stream");
-            h.stop_stream();
-            restarted = true;
-            if let Err(e) = start_stream(&mut h, shared, scale) {
-                shared.status(|s| s.last_error = Some(format!("스트림 재시작 실패: {e}")));
-                break;
-            }
-        } else if restarted && idle < 500 {
-            restarted = false;
-            shared.status(|s| s.state = ConnState::Streaming);
+            break;
         }
 
         // Frame rate from the frame counter (no USB traffic), refreshed every second.
@@ -386,8 +405,17 @@ fn session(
     }
 
     let streamed = shared.frames.load(Ordering::Relaxed) > start_frames;
-    drop(h); // stops streaming and closes the device
-    shared.status(|s| s.fps = 0.0);
+    h.stop_stream();
+    let stuck = h.has_stuck_transfers();
+    drop(h); // closes the device (libuvc keeps the handle open if transfers are stuck)
+    shared.status(|s| {
+        s.fps = 0.0;
+        if stuck {
+            s.state = ConnState::NeedsReplug;
+            s.last_error =
+                Some("USB 전송이 끝나지 않았습니다. 프로그램을 닫고 USB를 다시 꽂아 주세요".into());
+        }
+    });
     streamed
 }
 

@@ -145,6 +145,8 @@ extern "C" {
         flags: u8,
     ) -> uvc_error_t;
     pub fn uvc_stop_streaming(devh: *mut uvc_device_handle_t);
+    /// Vendored-libuvc extension: a stop gave up on transfers still held by the OS.
+    pub fn uvc_has_stuck_transfers(devh: *mut uvc_device_handle_t) -> c_int;
 
     pub fn uvc_get_ctrl(
         devh: *mut uvc_device_handle_t,

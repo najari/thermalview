@@ -6,8 +6,19 @@ Only the files needed for uncompressed streaming are kept (`frame-mjpeg.c`, exam
 
 ## Local changes
 
-`claim-before-probe.patch` holds the full diff against upstream. Re-apply it when updating libuvc.
+`local-changes.patch` holds the full diff against upstream. Re-apply it when updating libuvc. Every change is marked `ThermalView patch` in the source.
 
-1. **Claim the VS interface before the GET_MAX probe** (`uvc_get_stream_ctrl_format_size`, two places). Without it, on Windows/WinUSB the probe request goes through another interface's handle, the device STALLs and libusb's auto-release drops the claim on interface 0, so `uvc_start_streaming` fails with `Access denied`.
-3. **Control-transfer timeout** (`UVC_CTRL_TIMEOUT_MS` = 2000 in `libuvc_internal.h`, used in `ctrl.c` and the probe/commit request in `stream.c`). Upstream passes 0 (wait forever): when the PureThermal firmware stops answering an XU request, the calling thread and process exit hung forever, and the process stayed in the kernel holding the WinUSB handle until the USB cable was replugged.
-2. **`LIBUVC_TRACE` environment variable** in `stream.c`: `1` logs each assembled frame size, `2` also logs every isochronous packet. Off by default.
+**Windows/WinUSB bring-up**
+
+1. **Claim the VS interface before the GET_MAX probe** (`uvc_get_stream_ctrl_format_size`). Without it the probe goes through another interface's handle, the device STALLs, libusb's auto-release drops the claim on interface 0, and `uvc_start_streaming` fails with `Access denied`.
+2. **`LIBUVC_TRACE` environment variable** in `stream.c`: `1` logs frame sizes and stop/cancel results, `2` also logs every isochronous packet. Off by default.
+3. **Control-transfer timeout** (`UVC_CTRL_TIMEOUT_MS` = 2000). Upstream passes 0 (wait forever): when the firmware stopped answering an XU request, the calling thread and process exit hung, and the process stayed in the kernel holding the WinUSB handle.
+
+**Teardown and reconnect** (found with `examples/churn` under a debugger; each could crash or kill the stream)
+
+4. **`gettimeofday` epoch** (`stream.c`). The MSVC version subtracted the 1601-to-1970 offset in 100 ns units from microseconds, so every timed wait expired at once, including "wait for cancelled transfers" in `uvc_stream_stop`.
+5. **Event thread on reopen** (`uvc_start_handler_thread`). `kill_handler_thread` was never cleared, so after closing the last device a reopen in the same context got an event thread that exited immediately: no frames, and no transfer ever completed.
+6. **Status transfer on close** (`uvc_close`). The interrupt transfer has no timeout and was never cancelled, so its completion wrote into the freed device handle (heap corruption). It is now cancelled and awaited.
+7. **Stopping a stream** (`uvc_stream_stop`, `_uvc_stream_callback`). Isochronous transfers now drain on their own, and cancelling is only a fallback, because libusb's WinUSB ContinueStream wrapper silently resubmits cancelled transfers. Every transfer that is not resubmitted is reaped by the callback, and the callback touches no frame buffer after stop.
+8. **Never free under live transfers** (`uvc_stream_close`, `uvc_close`, `uvc_exit`). If transfers are still out after the wait, the stream and handle are kept open (about 2 MiB) and `uvc_has_stuck_transfers()` reports it, so the app can ask for a replug instead of crashing.
+9. **Bounds and races.** `_uvc_process_payload` drops a frame that would overflow `outbuf` (upstream had no check). `_uvc_user_caller` reads `transfers[0]` under the lock. A failed submit frees the transfers that were never submitted. `LIBUVC_XFER_BUF_SIZE` is 1 MiB instead of 16 MiB.
