@@ -19,6 +19,7 @@ serde_json = "1"
 eframe = "0.37"
 image = { version = "0.25", default-features = false, features = ["png"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+egui_plot = "0.38"
 
 [profile.release]
 debug = "line-tables-only"

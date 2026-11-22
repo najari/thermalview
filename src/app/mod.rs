@@ -1,5 +1,6 @@
 //! eframe application: image view, control panel, status bar.
 
+mod graphs;
 mod view;
 
 use std::time::{Duration, Instant};
@@ -9,8 +10,10 @@ use eframe::egui;
 use crate::camera::lepton::ShutterMode;
 use crate::camera::{Camera, CameraStatus, Command, ConnState};
 use crate::settings::Settings;
+use crate::storage::csv_log::{self, CsvLog};
 use crate::storage::snapshot::{self, SnapshotMeta, SpotReading};
 use crate::thermal::frame::{FrameStats, ThermalFrame};
+use crate::thermal::history::{History, Sample};
 use crate::thermal::palette::{self, Palette};
 use crate::thermal::range::{AutoRange, RangeMode};
 
@@ -30,6 +33,12 @@ pub struct ThermalApp {
 
     confirm_ffc: bool,
     message: Option<(String, Instant)>,
+
+    started: Instant,
+    history: History,
+    graphs: graphs::GraphState,
+    csv: Option<CsvLog>,
+    last_fpa: Option<f32>,
 }
 
 impl ThermalApp {
@@ -52,6 +61,79 @@ impl ThermalApp {
             display_range: (20.0, 40.0),
             confirm_ffc: false,
             message: None,
+            started: Instant::now(),
+            history: History::default(),
+            graphs: graphs::GraphState::default(),
+            csv: None,
+            last_fpa: None,
+        }
+    }
+
+    /// Current spot readings as (id, value).
+    fn spot_values(&self, f: &ThermalFrame) -> Vec<(u32, f32)> {
+        self.settings
+            .spots
+            .items
+            .iter()
+            .filter_map(|s| s.value(f).map(|v| (s.id, v)))
+            .collect()
+    }
+
+    /// Append the newest frame to the time series and, if recording, to the CSV log.
+    fn record(&mut self) {
+        let (Some(f), Some(st)) = (&self.frame, &self.stats) else {
+            return;
+        };
+        let spots = self.spot_values(f);
+        let sample = Sample {
+            t: self.started.elapsed().as_secs_f64(),
+            max: f.value(st.max),
+            min: f.value(st.min),
+            mean: value_of_mean(f, st.mean),
+            center: f.value_around(f.width / 2, f.height / 2, 1),
+        };
+        let ids: Vec<u32> = spots.iter().map(|(id, _)| *id).collect();
+        self.history.retain_spots(&ids);
+        self.history.push(sample, &spots);
+        if let Some(log) = &mut self.csv {
+            let row = csv_log::Row {
+                sequence: f.sequence,
+                max: sample.max,
+                min: sample.min,
+                mean: sample.mean,
+                center: sample.center,
+                fpa_c: self.last_fpa,
+                spots: &spots,
+            };
+            if let Err(e) = log.write(row) {
+                let msg = format!("CSV 기록 중단: {e}");
+                self.csv = None;
+                self.notify(msg);
+            }
+        }
+    }
+
+    fn toggle_csv(&mut self) {
+        if let Some(log) = self.csv.take() {
+            match log.finish() {
+                Ok((path, rows)) => {
+                    self.notify(format!("기록 종료: {rows}행 → {}", path.display()))
+                }
+                Err(e) => self.notify(format!("CSV 저장 실패: {e}")),
+            }
+            return;
+        }
+        let unit = match self.frame.as_ref().map(|f| f.is_radiometric()) {
+            Some(false) => "cnt",
+            _ => "C",
+        };
+        let ids: Vec<u32> = self.settings.spots.items.iter().map(|s| s.id).collect();
+        match CsvLog::start(&self.settings.snapshot_dir(), &ids, unit) {
+            Ok(log) => {
+                self.notify(format!("기록 시작: {}", log.path().display()));
+                self.csv = Some(log);
+            }
+            Err(e) => self.notify(format!("CSV 파일을 만들 수 없습니다: {e}")),
         }
     }
 
@@ -80,6 +162,7 @@ impl ThermalApp {
             self.stats = Some(f.stats());
             self.frame = Some(f);
             self.render(ctx);
+            self.record();
         }
     }
 
@@ -387,6 +470,7 @@ impl eframe::App for ThermalApp {
         let ctx = ui.ctx().clone();
         self.update_frame(&ctx);
         let status = self.camera.status();
+        self.last_fpa = status.fpa_c;
 
         egui::Panel::top("toolbar").show(ui, |ui| {
             ui.horizontal(|ui| {
@@ -398,11 +482,27 @@ impl eframe::App for ThermalApp {
                 {
                     self.take_snapshot(&status);
                 }
+                let rec_label = match &self.csv {
+                    Some(log) => format!("⏹ 기록 중지 ({}행)", log.rows()),
+                    None => "⏺ CSV 기록".to_string(),
+                };
+                if ui
+                    .add_enabled(
+                        self.frame.is_some() || self.csv.is_some(),
+                        egui::Button::new(rec_label).selected(self.csv.is_some()),
+                    )
+                    .on_hover_text("프레임마다 최고·최저·평균·중앙·측정점 값을 CSV로 기록")
+                    .clicked()
+                {
+                    self.toggle_csv();
+                }
                 if ui.button("📁 저장 폴더").clicked() {
                     let dir = self.settings.snapshot_dir();
                     let _ = std::fs::create_dir_all(&dir);
                     let _ = std::process::Command::new("explorer").arg(&dir).spawn();
                 }
+                ui.separator();
+                ui.toggle_value(&mut self.graphs.visible, "📈 그래프");
             });
         });
 
@@ -427,6 +527,13 @@ impl eframe::App for ThermalApp {
             .default_size(290.0)
             .show(ui, |ui| self.controls(ui, &status));
 
+        if self.graphs.visible {
+            egui::Panel::bottom("graphs")
+                .resizable(true)
+                .default_size(240.0)
+                .show(ui, |ui| graphs::show(ui, self));
+        }
+
         egui::CentralPanel::default().show(ui, |ui| {
             if view::image_view(ui, self) {
                 self.mark_dirty();
@@ -441,6 +548,9 @@ impl eframe::App for ThermalApp {
 
     fn on_exit(&mut self) {
         self.save_settings_if_due(true);
+        if let Some(log) = self.csv.take() {
+            let _ = log.finish();
+        }
     }
 }
 
