@@ -29,7 +29,7 @@ impl Player {
     pub fn open(path: &Path) -> anyhow::Result<Self> {
         let mut reader = SeqReader::open(path)?;
         anyhow::ensure!(!reader.is_empty(), "녹화된 프레임이 없습니다");
-        let total_ms = reader.timestamp(reader.len() - 1)?;
+        let total_ms = reader.timestamp(reader.len() - 1);
         let first = reader.frame(0)?;
         Ok(Self {
             reader,
@@ -80,7 +80,7 @@ impl Player {
             self.playing = false;
             self.anchor = (Instant::now(), self.total_ms);
         }
-        let i = self.reader.index_at(t.min(self.total_ms))?;
+        let i = self.reader.index_at(t.min(self.total_ms));
         if i != self.index {
             self.index = i;
             return Ok(Some(self.reader.frame(i)?));

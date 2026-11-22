@@ -18,6 +18,36 @@ pub struct Shape {
     pub b: (usize, usize),
 }
 
+/// Which endpoint coordinates follow the pointer while a shape is being edited.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Grab {
+    pub ax: bool,
+    pub ay: bool,
+    pub bx: bool,
+    pub by: bool,
+}
+
+impl Grab {
+    pub const MOVE: Grab = Grab {
+        ax: true,
+        ay: true,
+        bx: true,
+        by: true,
+    };
+    pub const END_A: Grab = Grab {
+        ax: true,
+        ay: true,
+        bx: false,
+        by: false,
+    };
+    pub const END_B: Grab = Grab {
+        ax: false,
+        ay: false,
+        bx: true,
+        by: true,
+    };
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ShapeStats {
     pub min: f32,
@@ -96,6 +126,90 @@ impl Shape {
                 [d, f.value(f.at(x, y)) as f64]
             })
             .collect()
+    }
+
+    /// Box with `a` top-left and `b` bottom-right; lines are unchanged (their direction matters).
+    pub fn normalized(&self) -> Shape {
+        match self.kind {
+            ShapeKind::Line => *self,
+            ShapeKind::Box => Shape {
+                a: (self.a.0.min(self.b.0), self.a.1.min(self.b.1)),
+                b: (self.a.0.max(self.b.0), self.a.1.max(self.b.1)),
+                ..*self
+            },
+        }
+    }
+
+    /// What a drag starting at (x, y) would edit. Line: an endpoint, or the whole line. Box: a
+    /// corner or edge, or (with `interior`) the whole box when grabbed inside.
+    pub fn grab_at(&self, x: f32, y: f32, tol: f32, interior: bool) -> Option<Grab> {
+        let s = self.normalized();
+        match s.kind {
+            ShapeKind::Line => {
+                let (ax, ay) = (s.a.0 as f32 + 0.5, s.a.1 as f32 + 0.5);
+                let (bx, by) = (s.b.0 as f32 + 0.5, s.b.1 as f32 + 0.5);
+                if (x - ax).hypot(y - ay) <= tol {
+                    Some(Grab::END_A)
+                } else if (x - bx).hypot(y - by) <= tol {
+                    Some(Grab::END_B)
+                } else if seg_dist(x, y, ax, ay, bx, by) <= tol {
+                    Some(Grab::MOVE)
+                } else {
+                    None
+                }
+            }
+            ShapeKind::Box => {
+                // The outline runs along pixel edges.
+                let (x0, y0) = (s.a.0 as f32, s.a.1 as f32);
+                let (x1, y1) = (s.b.0 as f32 + 1.0, s.b.1 as f32 + 1.0);
+                if x < x0 - tol || x > x1 + tol || y < y0 - tol || y > y1 + tol {
+                    return None;
+                }
+                let (left, top) = ((x - x0).abs() <= tol, (y - y0).abs() <= tol);
+                let (right, bottom) = ((x - x1).abs() <= tol, (y - y1).abs() <= tol);
+                if left || right || top || bottom {
+                    Some(Grab {
+                        ax: left,
+                        ay: top,
+                        bx: right && !left,
+                        by: bottom && !top,
+                    })
+                } else {
+                    interior.then_some(Grab::MOVE)
+                }
+            }
+        }
+    }
+
+    /// This shape after dragging by (dx, dy) pixels, kept inside a w×h frame. A whole-shape move
+    /// stops at the frame edge instead of squashing the shape.
+    pub fn dragged(&self, grab: Grab, dx: i64, dy: i64, w: usize, h: usize) -> Shape {
+        let (max_x, max_y) = (w as i64 - 1, h as i64 - 1);
+        let (mut dx, mut dy) = (dx, dy);
+        if grab == Grab::MOVE {
+            let (x0, x1) = (self.a.0.min(self.b.0) as i64, self.a.0.max(self.b.0) as i64);
+            let (y0, y1) = (self.a.1.min(self.b.1) as i64, self.a.1.max(self.b.1) as i64);
+            dx = dx.clamp(-x0, max_x - x1);
+            dy = dy.clamp(-y0, max_y - y1);
+        }
+        let shift = |v: usize, on: bool, d: i64, max: i64| {
+            if on {
+                (v as i64 + d).clamp(0, max) as usize
+            } else {
+                v
+            }
+        };
+        Shape {
+            a: (
+                shift(self.a.0, grab.ax, dx, max_x),
+                shift(self.a.1, grab.ay, dy, max_y),
+            ),
+            b: (
+                shift(self.b.0, grab.bx, dx, max_x),
+                shift(self.b.1, grab.by, dy, max_y),
+            ),
+            ..*self
+        }
     }
 
     /// Distance (pixels) from point (x, y) to the shape outline / segment.
@@ -190,10 +304,27 @@ impl Shapes {
         self.next_id = 0;
     }
 
-    /// Nearest shape within `max_dist` pixels of (x, y).
+    /// Topmost (newest) shape a drag at (x, y) would edit, normalized, with what it grabs.
+    pub fn grab(&self, x: f32, y: f32, tol: f32, interior: bool) -> Option<(Shape, Grab)> {
+        self.items
+            .iter()
+            .rev()
+            .find_map(|s| s.grab_at(x, y, tol, interior).map(|g| (s.normalized(), g)))
+    }
+
+    /// Replace the shape with the same id.
+    pub fn update(&mut self, shape: Shape) {
+        if let Some(s) = self.items.iter_mut().find(|s| s.id == shape.id) {
+            *s = shape;
+        }
+    }
+
+    /// Nearest shape within `max_dist` pixels of (x, y). On a tie (a point inside overlapping
+    /// boxes) the newest wins, the same one a drag would grab.
     pub fn hit(&self, x: f32, y: f32, max_dist: f32) -> Option<u32> {
         self.items
             .iter()
+            .rev()
             .map(|s| (s.id, s.distance(x, y)))
             .filter(|(_, d)| *d <= max_dist)
             .min_by(|a, b| a.1.total_cmp(&b.1))
@@ -250,6 +381,76 @@ mod tests {
     fn bresenham_diagonal() {
         assert_eq!(bresenham((0, 0), (2, 2)), vec![(0, 0), (1, 1), (2, 2)]);
         assert_eq!(bresenham((2, 0), (0, 1)).len(), 3);
+    }
+
+    #[test]
+    fn grabbing_a_box() {
+        let b = Shape {
+            id: 1,
+            kind: ShapeKind::Box,
+            a: (30, 40),
+            b: (10, 20), // drawn right-to-left
+        };
+        // top-left corner of the normalized box
+        assert_eq!(
+            b.grab_at(10.0, 20.0, 1.0, false),
+            Some(Grab {
+                ax: true,
+                ay: true,
+                bx: false,
+                by: false
+            })
+        );
+        // right edge only (outline at x = 31)
+        assert_eq!(
+            b.grab_at(31.0, 30.0, 1.0, false),
+            Some(Grab {
+                ax: false,
+                ay: false,
+                bx: true,
+                by: false
+            })
+        );
+        // inside: only moves when allowed
+        assert_eq!(b.grab_at(20.0, 30.0, 1.0, false), None);
+        assert_eq!(b.grab_at(20.0, 30.0, 1.0, true), Some(Grab::MOVE));
+        assert_eq!(b.grab_at(50.0, 30.0, 1.0, true), None);
+    }
+
+    #[test]
+    fn dragging_keeps_shapes_in_frame() {
+        let b = Shape {
+            id: 1,
+            kind: ShapeKind::Box,
+            a: (10, 10),
+            b: (20, 15),
+        };
+        // a whole-box move stops at the edge and keeps its size
+        let m = b.dragged(Grab::MOVE, 500, -500, 160, 120);
+        assert_eq!((m.a, m.b), ((149, 0), (159, 5)));
+        let l = Shape {
+            id: 2,
+            kind: ShapeKind::Line,
+            a: (5, 5),
+            b: (50, 60),
+        };
+        // moving one end leaves the other alone and clamps
+        let e = l.dragged(Grab::END_B, 500, 3, 160, 120);
+        assert_eq!((e.a, e.b), ((5, 5), (159, 63)));
+    }
+
+    #[test]
+    fn line_grab_prefers_endpoints() {
+        let l = Shape {
+            id: 1,
+            kind: ShapeKind::Line,
+            a: (0, 0),
+            b: (100, 0),
+        };
+        assert_eq!(l.grab_at(0.5, 0.5, 2.0, false), Some(Grab::END_A));
+        assert_eq!(l.grab_at(100.0, 1.0, 2.0, false), Some(Grab::END_B));
+        assert_eq!(l.grab_at(50.0, 1.0, 2.0, false), Some(Grab::MOVE));
+        assert_eq!(l.grab_at(50.0, 9.0, 2.0, false), None);
     }
 
     #[test]

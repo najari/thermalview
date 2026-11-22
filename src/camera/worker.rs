@@ -129,6 +129,26 @@ impl Camera {
         Self { shared, tx, thread }
     }
 
+    /// A camera with no worker thread and no USB access, for UI tests.
+    #[cfg(test)]
+    pub(crate) fn disconnected() -> Self {
+        let shared = Arc::new(Shared {
+            latest: Mutex::new(None),
+            status: Mutex::new(CameraStatus::default()),
+            frames: AtomicU64::new(0),
+            last_frame_ms: AtomicU64::new(0),
+            epoch: Instant::now(),
+            stop: AtomicBool::new(false),
+            repaint: Box::new(|| {}),
+        });
+        let (tx, _rx) = mpsc::channel();
+        Self {
+            shared,
+            tx,
+            thread: None,
+        }
+    }
+
     /// Take the newest frame if one arrived since the last call.
     pub fn take_frame(&self) -> Option<ThermalFrame> {
         self.shared.latest.lock().ok().and_then(|mut l| l.take())

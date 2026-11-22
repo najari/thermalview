@@ -4,7 +4,7 @@ use eframe::egui::{self, pos2, vec2, Align2, Color32, FontId, Rect, Sense, Strok
 
 use std::time::Instant;
 
-use super::{ThermalApp, Tool};
+use super::{DragOp, ThermalApp, Tool};
 use crate::thermal::measure::Spots;
 use crate::thermal::shapes::{Shape, ShapeKind, Shapes};
 
@@ -55,6 +55,80 @@ pub(super) fn image_view(ui: &mut egui::Ui, app: &mut ThermalApp) -> bool {
         (x < f.width && y < f.height).then_some((x, y))
     };
     let font = FontId::proportional(13.0);
+    let clamp_px = |p: egui::Pos2| -> (usize, usize) {
+        let x = ((p.x - img_rect.min.x) / scale).clamp(0.0, w - 1.0) as usize;
+        let y = ((p.y - img_rect.min.y) / scale).clamp(0.0, h - 1.0) as usize;
+        (x, y)
+    };
+    let image_xy = |p: egui::Pos2| {
+        (
+            (p.x - img_rect.min.x) / scale,
+            (p.y - img_rect.min.y) / scale,
+        )
+    };
+    // About 7 screen pixels, whatever the zoom.
+    let grab_tol = (7.0 / scale).max(0.75);
+    let mut changed = false;
+
+    // Start and follow drags first, so edited measurements are drawn in their new place.
+    let what_is_at = |app: &ThermalApp, p: egui::Pos2| -> Option<DragOp> {
+        if !img_rect.contains(p) {
+            return None;
+        }
+        let (x, y) = image_xy(p);
+        if let Some(id) = app.settings.spots.hit(x, y, grab_tol) {
+            return Some(DragOp::MoveSpot { id });
+        }
+        // Inside a box the Spot tool moves it; the Box/Line tools draw a new shape there.
+        let interior = app.tool == Tool::Spot;
+        if let Some((original, grab)) = app.settings.shapes.grab(x, y, grab_tol, interior) {
+            return Some(DragOp::EditShape {
+                original,
+                grab,
+                origin: clamp_px(p),
+            });
+        }
+        app.tool.shape_kind().map(|kind| DragOp::Draw {
+            kind,
+            from: clamp_px(p),
+            to: clamp_px(p),
+        })
+    };
+    if resp.drag_started() {
+        app.drag = ui
+            .input(|i| i.pointer.press_origin())
+            .and_then(|p| what_is_at(app, p));
+    }
+    if resp.dragged() {
+        if let Some(p) = resp.interact_pointer_pos() {
+            let now = clamp_px(p);
+            match &mut app.drag {
+                Some(DragOp::Draw { to, .. }) => *to = now,
+                Some(DragOp::MoveSpot { id }) => app.settings.spots.set_pos(*id, now.0, now.1),
+                Some(DragOp::EditShape {
+                    original,
+                    grab,
+                    origin,
+                }) => {
+                    let dx = now.0 as i64 - origin.0 as i64;
+                    let dy = now.1 as i64 - origin.1 as i64;
+                    let edited = original.dragged(*grab, dx, dy, f.width, f.height);
+                    app.settings.shapes.update(edited);
+                }
+                None => {}
+            }
+        }
+    }
+    if app.drag.is_some() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+    } else if let Some(p) = resp.hover_pos() {
+        if matches!(
+            what_is_at(app, p),
+            Some(DragOp::MoveSpot { .. } | DragOp::EditShape { .. })
+        ) {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+        }
+    }
 
     // Max / min markers.
     if app.settings.show_extremes {
@@ -144,22 +218,16 @@ pub(super) fn image_view(ui: &mut egui::Ui, app: &mut ThermalApp) -> bool {
     }
 
     // Shape being drawn.
-    let clamp_px = |p: egui::Pos2| -> (usize, usize) {
-        let x = ((p.x - img_rect.min.x) / scale).clamp(0.0, w - 1.0) as usize;
-        let y = ((p.y - img_rect.min.y) / scale).clamp(0.0, h - 1.0) as usize;
-        (x, y)
-    };
-    if resp.dragged() {
-        if let Some(p) = resp.interact_pointer_pos() {
-            app.drag_to = Some(clamp_px(p));
-        }
-    }
-    let preview = match (app.tool.shape_kind(), app.drag_from, app.drag_to) {
-        (Some(kind), Some(a), Some(b)) => Some(Shape { id: 0, kind, a, b }),
-        _ => None,
-    };
-    if let Some(s) = &preview {
-        draw_shape(s, Color32::YELLOW);
+    if let Some(DragOp::Draw { kind, from, to }) = app.drag {
+        draw_shape(
+            &Shape {
+                id: 0,
+                kind,
+                a: from,
+                b: to,
+            },
+            Color32::YELLOW,
+        );
     }
 
     // Hover readout.
@@ -217,17 +285,12 @@ pub(super) fn image_view(ui: &mut egui::Ui, app: &mut ThermalApp) -> bool {
         );
     }
 
-    // Pointer: Spot tool clicks add spots; Box/Line tools drag to draw; right-click deletes
-    // the nearest spot or shape.
-    let mut changed = false;
-    if resp.drag_started() && app.tool.shape_kind().is_some() {
-        app.drag_from = ui.input(|i| i.pointer.press_origin()).and_then(to_pixel);
-        app.drag_to = app.drag_from;
-    }
+    // Pointer: click adds a spot (Spot tool); drag edits what is under the pointer, or draws a
+    // new shape (Box/Line tools); right-click deletes the nearest spot or shape.
     if resp.drag_stopped() {
-        if let Some(s) = preview {
-            if s.a != s.b {
-                if app.settings.shapes.add(s.kind, s.a, s.b).is_none() {
+        match app.drag.take() {
+            Some(DragOp::Draw { kind, from, to }) if from != to => {
+                if app.settings.shapes.add(kind, from, to).is_none() {
                     app.message = Some((
                         format!("영역·선은 최대 {}개입니다", Shapes::MAX),
                         Instant::now(),
@@ -235,9 +298,9 @@ pub(super) fn image_view(ui: &mut egui::Ui, app: &mut ThermalApp) -> bool {
                 }
                 changed = true;
             }
+            Some(DragOp::Draw { .. }) | None => {}
+            Some(_) => changed = true,
         }
-        app.drag_from = None;
-        app.drag_to = None;
     }
     if let Some(p) = resp.interact_pointer_pos() {
         let px = (p.x - img_rect.min.x) / scale;
@@ -252,7 +315,10 @@ pub(super) fn image_view(ui: &mut egui::Ui, app: &mut ThermalApp) -> bool {
                 _ => {}
             }
             changed |= spot.is_some() || shape.is_some();
-        } else if resp.clicked() && app.tool == Tool::Spot {
+        } else if resp.clicked()
+            && app.tool == Tool::Spot
+            && app.settings.spots.hit(px, py, grab_tol).is_none()
+        {
             if let Some((x, y)) = to_pixel(p) {
                 if app.settings.spots.add(x, y).is_none() {
                     app.message = Some((
@@ -304,4 +370,173 @@ fn label(
     let rect = Rect::from_min_size(pos, size).expand(2.0);
     p.rect_filled(rect, 2.0, Color32::from_black_alpha(160));
     p.galley(pos, galley, color);
+}
+
+#[cfg(test)]
+mod tests {
+    //! Headless UI tests: real egui input events, no window, GPU, mouse or camera.
+
+    use eframe::egui::{Event, Modifiers, PointerButton, Pos2, RawInput};
+
+    use super::*;
+    use crate::camera::Camera;
+    use crate::settings::Settings;
+    use crate::thermal::frame::ThermalFrame;
+
+    struct Rig {
+        ctx: egui::Context,
+        app: ThermalApp,
+        time: f64,
+    }
+
+    /// With an 800×600 view the image starts at (0, 0) at this many points per pixel.
+    const SCALE: f32 = (800.0 - BAR_WIDTH - BAR_LABELS - 16.0) / 160.0;
+
+    fn at(x: usize, y: usize) -> Pos2 {
+        pos2((x as f32 + 0.5) * SCALE, (y as f32 + 0.5) * SCALE)
+    }
+
+    impl Rig {
+        fn new() -> Self {
+            let ctx = egui::Context::default();
+            // Textures can only be created after the first pass.
+            let mut first = ctx.run_ui(RawInput::default(), |_| {});
+            first.textures_delta.clear(); // no renderer here: drop the texture updates
+            let mut app = ThermalApp::with_camera(Settings::default(), Camera::disconnected());
+            let f = ThermalFrame::new(160, 120, vec![30000; 160 * 120], Some(0.01));
+            app.stats = Some(f.stats());
+            app.frame = Some(f);
+            app.render(&ctx);
+            let mut rig = Self {
+                ctx,
+                app,
+                time: 0.0,
+            };
+            // egui hit-tests against the previous frame's widgets.
+            rig.step(vec![]);
+            rig.step(vec![]);
+            rig
+        }
+
+        fn step(&mut self, events: Vec<Event>) {
+            self.time += 1.0 / 30.0;
+            let raw = RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(800.0, 600.0))),
+                time: Some(self.time),
+                events,
+                ..Default::default()
+            };
+            let app = &mut self.app;
+            let mut out = self.ctx.run_ui(raw, |ui| {
+                egui::CentralPanel::no_frame().show(ui, |ui| {
+                    image_view(ui, app);
+                });
+            });
+            out.textures_delta.clear();
+        }
+
+        fn button(&mut self, pos: Pos2, button: PointerButton, pressed: bool) {
+            self.step(vec![Event::PointerButton {
+                pos,
+                button,
+                pressed,
+                modifiers: Modifiers::NONE,
+            }]);
+        }
+
+        fn click(&mut self, pos: Pos2, button: PointerButton) {
+            self.step(vec![Event::PointerMoved(pos)]);
+            self.button(pos, button, true);
+            self.button(pos, button, false);
+            self.step(vec![]);
+        }
+
+        fn drag(&mut self, from: Pos2, to: Pos2) {
+            self.step(vec![Event::PointerMoved(from)]);
+            self.button(from, PointerButton::Primary, true);
+            for i in 1..=6 {
+                self.step(vec![Event::PointerMoved(from.lerp(to, i as f32 / 6.0))]);
+            }
+            self.button(to, PointerButton::Primary, false);
+            self.step(vec![]);
+        }
+
+        fn spots(&self) -> Vec<(usize, usize)> {
+            let items = &self.app.settings.spots.items;
+            items.iter().map(|s| (s.x, s.y)).collect()
+        }
+
+        fn shapes(&self) -> Vec<((usize, usize), (usize, usize))> {
+            let items = &self.app.settings.shapes.items;
+            items.iter().map(|s| (s.a, s.b)).collect()
+        }
+    }
+
+    #[test]
+    fn click_adds_one_spot_and_right_click_removes_it() {
+        let mut r = Rig::new();
+        r.click(at(40, 50), PointerButton::Primary);
+        assert_eq!(r.spots(), vec![(40, 50)]);
+        // Clicking the same spot again must not stack a second one on it.
+        r.click(at(40, 50), PointerButton::Primary);
+        assert_eq!(r.spots().len(), 1);
+        r.click(at(40, 50), PointerButton::Secondary);
+        assert!(r.spots().is_empty());
+    }
+
+    #[test]
+    fn dragging_a_spot_moves_it() {
+        let mut r = Rig::new();
+        r.click(at(40, 50), PointerButton::Primary);
+        r.drag(at(40, 50), at(70, 60));
+        assert_eq!(r.spots(), vec![(70, 60)]);
+        assert!(r.app.drag.is_none());
+    }
+
+    #[test]
+    fn box_tool_draws_and_corner_resizes() {
+        let mut r = Rig::new();
+        r.app.tool = Tool::Box;
+        r.drag(at(20, 20), at(60, 50));
+        assert_eq!(r.shapes(), vec![((20, 20), (60, 50))]);
+        // Bottom-right corner of the outline is at pixel edge (61, 51).
+        let corner = pos2(61.0 * SCALE, 51.0 * SCALE);
+        r.drag(corner, corner + vec2(10.0, 5.0) * SCALE);
+        assert_eq!(r.shapes(), vec![((20, 20), (70, 55))]);
+    }
+
+    #[test]
+    fn inside_a_box_spot_tool_moves_but_box_tool_draws() {
+        let mut r = Rig::new();
+        r.app.tool = Tool::Box;
+        r.drag(at(20, 20), at(60, 50));
+        // Box tool, starting inside: a second, new box.
+        r.drag(at(30, 30), at(40, 40));
+        assert_eq!(r.shapes().len(), 2);
+        r.click(at(35, 35), PointerButton::Secondary);
+        assert_eq!(r.shapes().len(), 1);
+        // Spot tool, starting inside: moves the box and keeps its size.
+        r.app.tool = Tool::Spot;
+        r.drag(at(30, 30), at(50, 40));
+        assert_eq!(r.shapes(), vec![((40, 30), (80, 60))]);
+        assert!(r.spots().is_empty());
+    }
+
+    #[test]
+    fn dragging_a_line_end_leaves_the_other_end() {
+        let mut r = Rig::new();
+        r.app.tool = Tool::Line;
+        r.drag(at(10, 80), at(150, 80));
+        assert_eq!(r.shapes(), vec![((10, 80), (150, 80))]);
+        r.drag(at(150, 80), at(120, 100));
+        assert_eq!(r.shapes(), vec![((10, 80), (120, 100))]);
+    }
+
+    #[test]
+    fn dragging_past_the_edge_stays_in_the_image() {
+        let mut r = Rig::new();
+        r.click(at(40, 50), PointerButton::Primary);
+        r.drag(at(40, 50), pos2(5000.0, 5000.0));
+        assert_eq!(r.spots(), vec![(159, 119)]);
+    }
 }

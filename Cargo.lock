@@ -3340,6 +3340,7 @@ dependencies = [
  "eframe",
  "egui_plot",
  "env_logger",
+ "flate2",
  "image",
  "libuvc-sys",
  "log",

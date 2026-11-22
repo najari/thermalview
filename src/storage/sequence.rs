@@ -1,26 +1,33 @@
 //! Radiometric sequence files (`.tvseq`): every frame's raw counts, for later playback/analysis.
 //!
 //! Layout (little-endian):
-//! - 8-byte magic `TVSEQ\0\x01\0`
+//! - 8-byte magic: `TVSEQ\0\x02\0` (compressed) or `TVSEQ\0\x01\0` (older, uncompressed)
 //! - u32 header length + UTF-8 JSON [`SeqHeader`]
-//! - fixed-size records: u64 milliseconds since recording start, u32 sensor sequence,
-//!   then width×height u16 raw counts.
+//! - records: u64 milliseconds since recording start, u32 sensor sequence, then
+//!   - v2: u32 payload length + lossless compressed frame (see [`encode_frame`])
+//!   - v1: width×height u16 raw counts
 //!
-//! Records are uncompressed (≈ 38 KB per frame, ≈ 1.2 GB per hour at 8.7 fps) so any frame can be
-//! read with one seek. Writing happens on a background thread.
+//! The reader scans the record headers once on open, so any frame is one seek away and a record
+//! cut short by a crash is simply ignored. Writing happens on a background thread.
 
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
+use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Instant, SystemTime};
 
+use flate2::read::DeflateDecoder;
+use flate2::write::DeflateEncoder;
+use flate2::Compression;
 use serde::{Deserialize, Serialize};
 
 use crate::thermal::frame::ThermalFrame;
 
-const MAGIC: &[u8; 8] = b"TVSEQ\0\x01\0";
+const MAGIC_V1: &[u8; 8] = b"TVSEQ\0\x01\0";
+const MAGIC_V2: &[u8; 8] = b"TVSEQ\0\x02\0";
 pub const EXTENSION: &str = "tvseq";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -32,8 +39,55 @@ pub struct SeqHeader {
     pub device: Option<String>,
 }
 
-fn record_size(h: &SeqHeader) -> u64 {
-    12 + (h.width * h.height * 2) as u64
+fn zigzag(v: i16) -> u16 {
+    ((v << 1) ^ (v >> 15)) as u16
+}
+
+fn unzigzag(v: u16) -> i16 {
+    ((v >> 1) as i16) ^ -((v & 1) as i16)
+}
+
+/// Lossless frame compression. Each pixel is predicted from its left neighbor (first column: the
+/// pixel above), residuals are zigzag-coded, low and high bytes are stored as separate planes
+/// (the high plane is almost all zeros), and the result is deflated.
+pub fn encode_frame(raw: &[u16], width: usize) -> std::io::Result<Vec<u8>> {
+    let mut planes = vec![0u8; raw.len() * 2];
+    let (low, high) = planes.split_at_mut(raw.len());
+    for (i, &v) in raw.iter().enumerate() {
+        let pred = if i == 0 {
+            0
+        } else if i % width == 0 {
+            raw[i - width]
+        } else {
+            raw[i - 1]
+        };
+        let z = zigzag(v.wrapping_sub(pred) as i16);
+        low[i] = z as u8;
+        high[i] = (z >> 8) as u8;
+    }
+    let mut enc = DeflateEncoder::new(Vec::with_capacity(raw.len()), Compression::fast());
+    enc.write_all(&planes)?;
+    enc.finish()
+}
+
+/// Inverse of [`encode_frame`] for a frame of `pixels` pixels.
+pub fn decode_frame(data: &[u8], pixels: usize, width: usize) -> std::io::Result<Vec<u16>> {
+    let mut planes = vec![0u8; pixels * 2];
+    DeflateDecoder::new(data).read_exact(&mut planes)?;
+    let (low, high) = planes.split_at(pixels);
+    let mut raw = vec![0u16; pixels];
+    for i in 0..pixels {
+        let z = u16::from_le_bytes([low[i], high[i]]);
+        let pred = if i == 0 {
+            0
+        } else if i % width == 0 {
+            raw[i - width]
+        } else {
+            raw[i - 1]
+        };
+        raw[i] = pred.wrapping_add(unzigzag(z) as u16);
+    }
+    Ok(raw)
 }
 
 /// Background writer. Frames are sent over a channel; the file is finalized by [`Self::finish`].
@@ -43,7 +97,7 @@ pub struct SeqWriter {
     thread: Option<JoinHandle<anyhow::Result<u64>>>,
     start: Instant,
     sent: u64,
-    header: SeqHeader,
+    bytes: Arc<AtomicU64>,
 }
 
 impl SeqWriter {
@@ -54,29 +108,29 @@ impl SeqWriter {
             .to_string();
         let path = dir.join(format!("{name}.{EXTENSION}"));
         let mut out = BufWriter::with_capacity(1 << 20, File::create(&path)?);
-        out.write_all(MAGIC)?;
+        out.write_all(MAGIC_V2)?;
         let json = serde_json::to_vec(&header)?;
         out.write_all(&(json.len() as u32).to_le_bytes())?;
         out.write_all(&json)?;
+        let bytes = Arc::new(AtomicU64::new((12 + json.len()) as u64));
 
         let (tx, rx) = mpsc::channel::<(u64, ThermalFrame)>();
         let (w, h) = (header.width, header.height);
+        let written = bytes.clone();
         let thread = std::thread::Builder::new()
             .name("seq-writer".into())
             .spawn(move || -> anyhow::Result<u64> {
                 let mut n = 0u64;
-                let mut buf = Vec::with_capacity(12 + w * h * 2);
                 for (t_ms, f) in rx {
                     if f.width != w || f.height != h {
                         continue;
                     }
-                    buf.clear();
-                    buf.extend_from_slice(&t_ms.to_le_bytes());
-                    buf.extend_from_slice(&f.sequence.to_le_bytes());
-                    for v in &f.raw {
-                        buf.extend_from_slice(&v.to_le_bytes());
-                    }
-                    out.write_all(&buf)?;
+                    let payload = encode_frame(&f.raw, w)?;
+                    out.write_all(&t_ms.to_le_bytes())?;
+                    out.write_all(&f.sequence.to_le_bytes())?;
+                    out.write_all(&(payload.len() as u32).to_le_bytes())?;
+                    out.write_all(&payload)?;
+                    written.fetch_add(16 + payload.len() as u64, Ordering::Relaxed);
                     n += 1;
                 }
                 out.flush()?;
@@ -88,7 +142,7 @@ impl SeqWriter {
             thread: Some(thread),
             start: Instant::now(),
             sent: 0,
-            header,
+            bytes,
         })
     }
 
@@ -100,8 +154,9 @@ impl SeqWriter {
         self.sent
     }
 
+    /// Bytes written so far (compressed size).
     pub fn bytes(&self) -> u64 {
-        self.sent * record_size(&self.header)
+        self.bytes.load(Ordering::Relaxed)
     }
 
     pub fn elapsed_secs(&self) -> f64 {
@@ -139,13 +194,23 @@ impl Drop for SeqWriter {
     }
 }
 
-/// Random-access reader.
+#[derive(Debug, Clone, Copy)]
+struct Entry {
+    /// File offset of the frame data.
+    offset: u64,
+    /// Bytes of frame data.
+    len: u32,
+    t_ms: u64,
+    sequence: u32,
+}
+
+/// Random-access reader for both format versions.
 pub struct SeqReader {
     path: PathBuf,
     file: BufReader<File>,
     pub header: SeqHeader,
-    data_offset: u64,
-    frames: usize,
+    compressed: bool,
+    index: Vec<Entry>,
 }
 
 impl SeqReader {
@@ -153,7 +218,11 @@ impl SeqReader {
         let mut file = BufReader::new(File::open(path)?);
         let mut magic = [0u8; 8];
         file.read_exact(&mut magic)?;
-        anyhow::ensure!(&magic == MAGIC, "not a ThermalView sequence file");
+        let compressed = match &magic {
+            m if m == MAGIC_V2 => true,
+            m if m == MAGIC_V1 => false,
+            _ => anyhow::bail!("not a ThermalView sequence file"),
+        };
         let mut len = [0u8; 4];
         file.read_exact(&mut len)?;
         let len = u32::from_le_bytes(len) as usize;
@@ -165,16 +234,40 @@ impl SeqReader {
             header.width > 0 && header.height > 0 && header.width * header.height <= 1 << 22,
             "bad frame size"
         );
-        let data_offset = 12 + len as u64;
+
+        // Scan the record headers. A record that does not fit in the file (crash) ends the scan.
         let total = file.get_ref().metadata()?.len();
-        // A partially written last record (e.g. after a crash) is ignored.
-        let frames = (total.saturating_sub(data_offset) / record_size(&header)) as usize;
+        let raw_len = (header.width * header.height * 2) as u64;
+        let head_len: u64 = if compressed { 16 } else { 12 };
+        let mut pos = 12 + len as u64;
+        let mut index = Vec::new();
+        let mut head = [0u8; 16];
+        while pos + head_len <= total {
+            file.seek(SeekFrom::Start(pos))?;
+            file.read_exact(&mut head[..head_len as usize])?;
+            let data_len = if compressed {
+                u32::from_le_bytes(head[12..16].try_into()?) as u64
+            } else {
+                raw_len
+            };
+            // Deflate can only expand incompressible data slightly.
+            if data_len > raw_len + raw_len / 8 + 1024 || pos + head_len + data_len > total {
+                break;
+            }
+            index.push(Entry {
+                offset: pos + head_len,
+                len: data_len as u32,
+                t_ms: u64::from_le_bytes(head[0..8].try_into()?),
+                sequence: u32::from_le_bytes(head[8..12].try_into()?),
+            });
+            pos += head_len + data_len;
+        }
         Ok(Self {
             path: path.to_path_buf(),
             file,
             header,
-            data_offset,
-            frames,
+            compressed,
+            index,
         })
     }
 
@@ -183,56 +276,44 @@ impl SeqReader {
     }
 
     pub fn len(&self) -> usize {
-        self.frames
+        self.index.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.frames == 0
+        self.index.is_empty()
     }
 
     /// Read frame `i`: (milliseconds since start, frame).
     pub fn frame(&mut self, i: usize) -> anyhow::Result<(u64, ThermalFrame)> {
-        anyhow::ensure!(i < self.frames, "frame {i} out of range");
-        let rs = record_size(&self.header);
-        self.file
-            .seek(SeekFrom::Start(self.data_offset + i as u64 * rs))?;
-        let mut rec = vec![0u8; rs as usize];
-        self.file.read_exact(&mut rec)?;
-        let t_ms = u64::from_le_bytes(rec[0..8].try_into()?);
-        let seq = u32::from_le_bytes(rec[8..12].try_into()?);
-        let raw = crate::thermal::frame::decode_le_u16(&rec[12..]);
-        let mut f = ThermalFrame::new(
-            self.header.width,
-            self.header.height,
-            raw,
-            self.header.kelvin_per_count,
-        );
-        f.sequence = seq;
+        let e = *self
+            .index
+            .get(i)
+            .ok_or_else(|| anyhow::anyhow!("frame {i} out of range"))?;
+        self.file.seek(SeekFrom::Start(e.offset))?;
+        let mut data = vec![0u8; e.len as usize];
+        self.file.read_exact(&mut data)?;
+        let (w, h) = (self.header.width, self.header.height);
+        let raw = if self.compressed {
+            decode_frame(&data, w * h, w)?
+        } else {
+            crate::thermal::frame::decode_le_u16(&data)
+        };
+        let mut f = ThermalFrame::new(w, h, raw, self.header.kelvin_per_count);
+        f.sequence = e.sequence;
         f.captured = SystemTime::UNIX_EPOCH;
-        Ok((t_ms, f))
+        Ok((e.t_ms, f))
     }
 
-    /// Index of the last frame at or before `t_ms` (binary search over timestamps).
-    pub fn index_at(&mut self, t_ms: u64) -> anyhow::Result<usize> {
-        let (mut lo, mut hi) = (0usize, self.frames);
-        while hi - lo > 1 {
-            let mid = (lo + hi) / 2;
-            if self.timestamp(mid)? <= t_ms {
-                lo = mid;
-            } else {
-                hi = mid;
-            }
-        }
-        Ok(lo)
+    /// Index of the last frame at or before `t_ms`.
+    pub fn index_at(&self, t_ms: u64) -> usize {
+        self.index
+            .partition_point(|e| e.t_ms <= t_ms)
+            .saturating_sub(1)
     }
 
-    pub fn timestamp(&mut self, i: usize) -> anyhow::Result<u64> {
-        let rs = record_size(&self.header);
-        self.file
-            .seek(SeekFrom::Start(self.data_offset + i as u64 * rs))?;
-        let mut t = [0u8; 8];
-        self.file.read_exact(&mut t)?;
-        Ok(u64::from_le_bytes(t))
+    /// Timestamp of frame `i` in milliseconds (0 if out of range).
+    pub fn timestamp(&self, i: usize) -> u64 {
+        self.index.get(i).map_or(0, |e| e.t_ms)
     }
 }
 
@@ -256,24 +337,50 @@ pub fn list(dir: &Path) -> Vec<(PathBuf, u64)> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn roundtrip_and_truncated_tail() {
-        let dir = std::env::temp_dir().join(format!("thermalview_seq_{}", std::process::id()));
-        let header = SeqHeader {
+    fn temp_dir(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("thermalview_seq_{tag}_{}", std::process::id()))
+    }
+
+    fn header() -> SeqHeader {
+        SeqHeader {
             width: 3,
             height: 2,
             kelvin_per_count: Some(0.01),
             started_local: "now".into(),
             device: None,
-        };
-        let mut w = SeqWriter::start(&dir, header.clone()).unwrap();
+        }
+    }
+
+    #[test]
+    fn codec_is_lossless_on_extremes() {
+        let raw: Vec<u16> = vec![
+            0, 65535, 1, 32768, 32767, 65535, 0, 0, 12345, 54321, 2, 65534,
+        ];
+        let enc = encode_frame(&raw, 4).unwrap();
+        assert_eq!(decode_frame(&enc, raw.len(), 4).unwrap(), raw);
+        for v in [i16::MIN, -1, 0, 1, i16::MAX] {
+            assert_eq!(unzigzag(zigzag(v)), v);
+        }
+    }
+
+    #[test]
+    fn smooth_frames_compress_well() {
+        let raw: Vec<u16> = (0..120)
+            .flat_map(|y| (0..160).map(move |x| 30000 + (x + y) as u16 / 4))
+            .collect();
+        let enc = encode_frame(&raw, 160).unwrap();
+        assert!(enc.len() < raw.len() / 4, "{} bytes", enc.len());
+        assert_eq!(decode_frame(&enc, raw.len(), 160).unwrap(), raw);
+    }
+
+    #[test]
+    fn roundtrip_and_truncated_tail() {
+        let dir = temp_dir("rt");
+        let h = header();
+        let mut w = SeqWriter::start(&dir, h.clone()).unwrap();
         for k in 0..5u16 {
-            let mut f = ThermalFrame::new(
-                3,
-                2,
-                (0..6).map(|i| 30000 + k * 10 + i).collect(),
-                Some(0.01),
-            );
+            let raw = (0..6).map(|i| 30000 + k * 10 + i).collect();
+            let mut f = ThermalFrame::new(3, 2, raw, Some(0.01));
             f.sequence = 100 + k as u32;
             w.push(&f);
         }
@@ -289,14 +396,42 @@ mod tests {
             .unwrap();
 
         let mut r = SeqReader::open(&path).unwrap();
-        assert_eq!(r.header, header);
+        assert_eq!(r.header, h);
         assert_eq!(r.len(), 5);
         let (_, f) = r.frame(3).unwrap();
         assert_eq!(f.sequence, 103);
         assert_eq!(f.raw, vec![30030, 30031, 30032, 30033, 30034, 30035]);
         assert!(r.frame(5).is_err());
-        assert_eq!(r.index_at(u64::MAX).unwrap(), 4);
+        assert_eq!(r.index_at(u64::MAX), 4);
         assert_eq!(list(&dir).len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn reads_uncompressed_v1_files() {
+        let dir = temp_dir("v1");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("old.tvseq");
+        let json = serde_json::to_vec(&header()).unwrap();
+        let mut b = MAGIC_V1.to_vec();
+        b.extend((json.len() as u32).to_le_bytes());
+        b.extend(&json);
+        for k in 0..3u64 {
+            b.extend((k * 100).to_le_bytes());
+            b.extend((7 + k as u32).to_le_bytes());
+            for i in 0..6u16 {
+                b.extend((29000 + k as u16 + i).to_le_bytes());
+            }
+        }
+        b.extend([9, 9]); // truncated next record
+        std::fs::write(&path, b).unwrap();
+
+        let mut r = SeqReader::open(&path).unwrap();
+        assert_eq!(r.len(), 3);
+        let (t, f) = r.frame(2).unwrap();
+        assert_eq!((t, f.sequence), (200, 9));
+        assert_eq!(f.raw[5], 29007);
+        assert_eq!(r.index_at(150), 1);
         std::fs::remove_dir_all(&dir).ok();
     }
 }

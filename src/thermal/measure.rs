@@ -52,6 +52,14 @@ impl Spots {
         self.next_id = 0;
     }
 
+    /// Move a spot to a new pixel.
+    pub fn set_pos(&mut self, id: u32, x: usize, y: usize) {
+        if let Some(s) = self.items.iter_mut().find(|s| s.id == id) {
+            s.x = x;
+            s.y = y;
+        }
+    }
+
     /// Spot within `max_dist` pixels of (x, y), nearest first.
     pub fn hit(&self, x: f32, y: f32, max_dist: f32) -> Option<u32> {
         self.items

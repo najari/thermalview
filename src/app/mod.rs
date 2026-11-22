@@ -18,7 +18,7 @@ use crate::thermal::frame::{FrameStats, ThermalFrame};
 use crate::thermal::history::{History, Sample};
 use crate::thermal::palette::{self, Palette};
 use crate::thermal::range::{AutoRange, RangeMode};
-use crate::thermal::shapes::ShapeKind;
+use crate::thermal::shapes::{Grab, Shape, ShapeKind};
 
 /// What a left click / drag on the image does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,6 +36,26 @@ impl Tool {
             Tool::Line => Some(ShapeKind::Line),
         }
     }
+}
+
+/// A pointer drag in progress on the image.
+#[derive(Debug, Clone, Copy)]
+enum DragOp {
+    /// Drawing a new Box/Line.
+    Draw {
+        kind: ShapeKind,
+        from: (usize, usize),
+        to: (usize, usize),
+    },
+    MoveSpot {
+        id: u32,
+    },
+    /// Moving or resizing an existing shape, relative to where the drag began.
+    EditShape {
+        original: Shape,
+        grab: Grab,
+        origin: (usize, usize),
+    },
 }
 
 pub struct ThermalApp {
@@ -62,9 +82,7 @@ pub struct ThermalApp {
     last_fpa: Option<f32>,
 
     tool: Tool,
-    /// Pixel where the current Box/Line drag started, and where it is now.
-    drag_from: Option<(usize, usize)>,
-    drag_to: Option<(usize, usize)>,
+    drag: Option<DragOp>,
 
     /// Radiometric sequence recording (live only).
     seq: Option<SeqWriter>,
@@ -79,6 +97,10 @@ impl ThermalApp {
         let settings = Settings::load();
         let ctx = cc.egui_ctx.clone();
         let camera = Camera::start(settings.shutter_mode, move || ctx.request_repaint());
+        Self::with_camera(settings, camera)
+    }
+
+    fn with_camera(settings: Settings, camera: Camera) -> Self {
         let lut = (settings.palette, settings.palette.lut());
         Self {
             camera,
@@ -99,8 +121,7 @@ impl ThermalApp {
             csv: None,
             last_fpa: None,
             tool: Tool::Spot,
-            drag_from: None,
-            drag_to: None,
+            drag: None,
             seq: None,
             player: None,
             show_open_dialog: false,
@@ -225,6 +246,13 @@ impl ThermalApp {
         self.history.retain_spots(&ids);
         self.history.push(sample, &spots);
         if let Some(log) = &mut self.csv {
+            let shapes: Vec<_> = self
+                .settings
+                .shapes
+                .items
+                .iter()
+                .filter_map(|s| s.stats(f).map(|st| (s.id, st)))
+                .collect();
             let row = csv_log::Row {
                 sequence: f.sequence,
                 max: sample.max,
@@ -233,6 +261,7 @@ impl ThermalApp {
                 center: sample.center,
                 fpa_c: self.last_fpa,
                 spots: &spots,
+                shapes: &shapes,
             };
             if let Err(e) = log.write(row) {
                 let msg = format!("CSV 기록 중단: {e}");
@@ -257,7 +286,14 @@ impl ThermalApp {
             _ => "C",
         };
         let ids: Vec<u32> = self.settings.spots.items.iter().map(|s| s.id).collect();
-        match CsvLog::start(&self.settings.snapshot_dir(), &ids, unit) {
+        let shapes: Vec<(u32, String)> = self
+            .settings
+            .shapes
+            .items
+            .iter()
+            .map(|s| (s.id, s.label()))
+            .collect();
+        match CsvLog::start(&self.settings.snapshot_dir(), &ids, &shapes, unit) {
             Ok(log) => {
                 self.notify(format!("기록 시작: {}", log.path().display()));
                 self.csv = Some(log);
@@ -557,9 +593,9 @@ impl ThermalApp {
                 ui.selectable_value(&mut self.tool, Tool::Line, "╱ 선");
             });
             ui.label(match self.tool {
-                Tool::Spot => "영상 클릭: 측정점 추가 · 우클릭: 삭제",
-                Tool::Box => "드래그: 영역 그리기 · 우클릭: 삭제",
-                Tool::Line => "드래그: 선 그리기 · 우클릭: 삭제",
+                Tool::Spot => "클릭: 점 추가 · 끌기: 측정 이동 · 우클릭: 삭제",
+                Tool::Box => "끌기: 영역 그리기, 테두리는 크기 조절 · 우클릭: 삭제",
+                Tool::Line => "끌기: 선 그리기, 끝점은 조절 · 우클릭: 삭제",
             });
             if let (Some(f), Some(st)) = (&self.frame, &self.stats) {
                 egui::Grid::new("stats").num_columns(2).show(ui, |ui| {
@@ -710,7 +746,9 @@ impl eframe::App for ThermalApp {
                         can_record,
                         egui::Button::new(seq_label).selected(self.seq.is_some()),
                     )
-                    .on_hover_text("모든 프레임의 온도 원본을 .tvseq 파일로 녹화 (약 1.2 GB/시간)")
+                    .on_hover_text(
+                        "모든 프레임의 온도 원본을 .tvseq 파일로 무손실 녹화 (약 0.6 GB/시간)",
+                    )
                     .clicked()
                 {
                     self.toggle_seq(&status);

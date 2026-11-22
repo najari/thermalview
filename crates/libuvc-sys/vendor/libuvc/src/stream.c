@@ -1336,7 +1336,7 @@ uvc_error_t uvc_stream_stop(uvc_stream_handle_t *strmh) {
      Isochronous transfers finish on their own within milliseconds, and the callback reaps them
      now that running == 0. Cancel only as a fallback (and always for bulk). A failed cancel
      does not prove a transfer is idle, so nothing is freed here. */
-  if (!isochronous || !_uvc_wait_transfers_done(strmh, 1000)) {
+  if (!isochronous || !_uvc_wait_transfers_done(strmh, 500)) {
     for (i = 0; i < LIBUVC_NUM_TRANSFER_BUFS; i++) {
       if (strmh->transfers[i] != NULL) {
         int res = libusb_cancel_transfer(strmh->transfers[i]);
@@ -1344,7 +1344,7 @@ uvc_error_t uvc_stream_stop(uvc_stream_handle_t *strmh) {
           fprintf(stderr, "[uvc-trace] cancel transfer %d -> %d (%s)\n", i, res, libusb_error_name(res));
       }
     }
-    if (!_uvc_wait_transfers_done(strmh, 3000)) {
+    if (!_uvc_wait_transfers_done(strmh, 1000)) {
       if (_uvc_trace_enabled())
         fprintf(stderr, "[uvc-trace] stop timed out with transfers pending\n");
       ret = UVC_ERROR_TIMEOUT;

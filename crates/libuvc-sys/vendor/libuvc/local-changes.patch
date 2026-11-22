@@ -235,7 +235,7 @@ index 041fe58..24519f6 100644
      pthread_create(&ctx->handler_thread, NULL, _uvc_handle_events, (void*) ctx);
  }
 diff --git a/src/stream.c b/src/stream.c
-index 185e4a7..23eec11 100644
+index 185e4a7..ef37654 100644
 --- a/src/stream.c
 +++ b/src/stream.c
 @@ -46,7 +46,10 @@
@@ -556,7 +556,7 @@ index 185e4a7..23eec11 100644
 +     Isochronous transfers finish on their own within milliseconds, and the callback reaps them
 +     now that running == 0. Cancel only as a fallback (and always for bulk). A failed cancel
 +     does not prove a transfer is idle, so nothing is freed here. */
-+  if (!isochronous || !_uvc_wait_transfers_done(strmh, 1000)) {
++  if (!isochronous || !_uvc_wait_transfers_done(strmh, 500)) {
 +    for (i = 0; i < LIBUVC_NUM_TRANSFER_BUFS; i++) {
 +      if (strmh->transfers[i] != NULL) {
 +        int res = libusb_cancel_transfer(strmh->transfers[i]);
@@ -586,7 +586,7 @@ index 185e4a7..23eec11 100644
 -    ts.tv_nsec += add_nsecs;
 -
 -    if (ETIMEDOUT == pthread_cond_timedwait(&strmh->cb_cond, &strmh->cb_mutex, &ts)){
-+    if (!_uvc_wait_transfers_done(strmh, 3000)) {
++    if (!_uvc_wait_transfers_done(strmh, 1000)) {
 +      if (_uvc_trace_enabled())
 +        fprintf(stderr, "[uvc-trace] stop timed out with transfers pending\n");
        ret = UVC_ERROR_TIMEOUT;
