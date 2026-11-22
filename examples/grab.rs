@@ -1,5 +1,6 @@
 //! Phase-1 check: open the PureThermal, stream Y16 for a few seconds and report the frame rate.
-//! Usage: cargo run --release --example grab [seconds]
+//! Usage: cargo run --release --example grab [seconds] [poll_ms]
+//! With `poll_ms` > 0 the Lepton status is read every poll_ms while streaming (like the app does).
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -12,6 +13,11 @@ fn main() -> anyhow::Result<()> {
         .nth(1)
         .and_then(|s| s.parse().ok())
         .unwrap_or(5);
+    // Optional: poll Lepton status every N ms while streaming (0 = no control traffic).
+    let poll_ms: u64 = std::env::args()
+        .nth(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
 
     let ctx = uvc::Context::new()?;
     let dev = ctx.find_device(VID, PID)?;
@@ -68,7 +74,27 @@ fn main() -> anyhow::Result<()> {
     let first_latency = t_start.elapsed();
     let n0 = frames.load(Ordering::Relaxed);
     let t0 = Instant::now();
-    std::thread::sleep(Duration::from_secs(secs));
+    if poll_ms == 0 {
+        std::thread::sleep(Duration::from_secs(secs));
+    } else {
+        // Same status reads the camera worker does, to measure their effect on the stream.
+        let mut polls = 0u32;
+        let mut worst = Duration::ZERO;
+        while t0.elapsed() < Duration::from_secs(secs) {
+            std::thread::sleep(Duration::from_millis(poll_ms));
+            let tp = Instant::now();
+            let _ = lepton::fpa_temp_c(&h);
+            let _ = lepton::get_shutter_mode_obj(&h);
+            let _ = lepton::aux_temp_c(&h);
+            let _ = lepton::ffc_status(&h);
+            worst = worst.max(tp.elapsed());
+            polls += 1;
+        }
+        println!(
+            "polling  : {polls} polls every {poll_ms} ms, slowest {:.1} ms",
+            worst.as_secs_f64() * 1000.0
+        );
+    }
     let n = frames.load(Ordering::Relaxed) - n0;
     let dt = t0.elapsed().as_secs_f64();
     h.stop_stream();

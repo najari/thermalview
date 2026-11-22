@@ -10,15 +10,16 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime};
 
-use super::lepton::{self, FfcStatus, ShutterMode};
+use super::lepton::{self, ShutterMode};
 use super::uvc::{self, DeviceInfo, Handle, UvcError};
 use super::{HEIGHT, PID, VID, WIDTH};
 use crate::thermal::frame::{decode_le_u16, ThermalFrame};
 
 /// No frame for this long → the stream is considered stalled.
 const STALL_TIMEOUT: Duration = Duration::from_secs(2);
-const STATUS_PERIOD: Duration = Duration::from_secs(1);
-const REAPPLY_PERIOD: Duration = Duration::from_secs(3);
+/// Lepton status poll + shutter-mode re-apply (2 CCI commands; see the session loop).
+const STATUS_PERIOD: Duration = Duration::from_secs(5);
+const FPS_PERIOD: Duration = Duration::from_secs(1);
 const RETRY_DELAY: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -57,10 +58,8 @@ pub struct CameraStatus {
     pub lepton_sw: Option<String>,
     pub kelvin_per_count: Option<f32>,
     pub fpa_c: Option<f32>,
-    pub aux_c: Option<f32>,
     pub shutter_mode: Option<ShutterMode>,
     pub since_ffc_s: Option<f32>,
-    pub ffc_status: Option<FfcStatus>,
     pub fps: f32,
     pub frames: u64,
     pub stalls: u32,
@@ -299,7 +298,6 @@ fn session(
     let start_frames = shared.frames.load(Ordering::Relaxed);
     let mut restarted = false;
     let mut last_status = Instant::now() - STATUS_PERIOD;
-    let mut last_reapply = Instant::now();
     let mut fps_mark = (Instant::now(), shared.frames.load(Ordering::Relaxed));
 
     while !shared.stop.load(Ordering::SeqCst) {
@@ -341,41 +339,46 @@ fn session(
             shared.status(|s| s.state = ConnState::Streaming);
         }
 
-        // Periodic status poll. A failing control transfer means the device is gone.
+        // Frame rate from the frame counter (no USB traffic), refreshed every second.
+        if fps_mark.0.elapsed() >= FPS_PERIOD {
+            let now_frames = shared.frames.load(Ordering::Relaxed);
+            let fps = (now_frames - fps_mark.1) as f32 / fps_mark.0.elapsed().as_secs_f32();
+            fps_mark = (Instant::now(), now_frames);
+            shared.status(|s| {
+                s.fps = fps;
+                s.frames = now_frames;
+            });
+        }
+
+        // Periodic Lepton poll. Every CCI command makes the PureThermal drop video frames
+        // (measured: 4 commands/s cost ~0.6 fps), so this is kept to 2 commands every 5 s.
+        // The same read re-applies the shutter mode if the Lepton reset itself to AUTO.
+        // A failing control transfer means the device is gone or wedged.
         if last_status.elapsed() >= STATUS_PERIOD {
             last_status = Instant::now();
-            let now_frames = shared.frames.load(Ordering::Relaxed);
-            let dt = fps_mark.0.elapsed().as_secs_f32();
-            let fps = (now_frames - fps_mark.1) as f32 / dt.max(1e-3);
-            fps_mark = (Instant::now(), now_frames);
             match poll_status(&h) {
-                Ok(p) => shared.status(|s| {
-                    s.fpa_c = Some(p.fpa_c);
-                    s.aux_c = p.aux_c;
-                    s.shutter_mode = ShutterMode::from_i32(p.mode);
-                    s.since_ffc_s = Some(p.since_ffc_ms as f32 / 1000.0);
-                    s.ffc_status = p.ffc_status;
-                    s.fps = fps;
-                    s.frames = now_frames;
-                }),
+                Ok(p) => {
+                    let reverted = p.mode != *desired as i32;
+                    shared.status(|s| {
+                        s.fpa_c = Some(p.fpa_c);
+                        s.shutter_mode = ShutterMode::from_i32(p.mode);
+                        s.since_ffc_s = Some(p.since_ffc_ms as f32 / 1000.0);
+                    });
+                    if reverted {
+                        match lepton::set_shutter_mode(&h, *desired) {
+                            Ok(()) => {
+                                log::warn!("shutter mode had reverted; re-applied {desired:?}");
+                                shared.status(|s| s.reapplied += 1);
+                            }
+                            Err(e) => log::warn!("re-applying shutter mode failed: {e}"),
+                        }
+                    }
+                }
                 Err(e) => {
                     log::warn!("status poll failed, treating device as disconnected: {e}");
                     shared.status(|s| s.last_error = Some(format!("장치 응답 없음: {e}")));
                     break;
                 }
-            }
-        }
-
-        // Lepton resets fall back to AUTO; keep the user's choice enforced.
-        if last_reapply.elapsed() >= REAPPLY_PERIOD {
-            last_reapply = Instant::now();
-            match enforce_mode(&h, *desired) {
-                Ok(true) => {
-                    log::warn!("shutter mode had reverted; re-applied {desired:?}");
-                    shared.status(|s| s.reapplied += 1);
-                }
-                Ok(false) => {}
-                Err(e) => log::warn!("shutter mode check failed: {e}"),
             }
         }
 
@@ -390,21 +393,18 @@ fn session(
 
 struct Poll {
     fpa_c: f32,
-    aux_c: Option<f32>,
     mode: i32,
     since_ffc_ms: u32,
-    ffc_status: Option<FfcStatus>,
 }
 
+/// Two CCI commands: FPA temperature and the FFC/shutter-mode object.
 fn poll_status(h: &Handle) -> lepton::Result<Poll> {
     let fpa_c = lepton::fpa_temp_c(h)?;
     let obj = lepton::get_shutter_mode_obj(h)?;
     Ok(Poll {
         fpa_c,
-        aux_c: lepton::aux_temp_c(h).ok(),
         mode: obj.mode(),
         since_ffc_ms: obj.elapsed_since_ffc_ms(),
-        ffc_status: lepton::ffc_status(h).ok(),
     })
 }
 

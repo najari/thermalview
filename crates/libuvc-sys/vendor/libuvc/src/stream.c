@@ -226,7 +226,7 @@ uvc_error_t uvc_query_stream_ctrl(
       req,
       probe ? (UVC_VS_PROBE_CONTROL << 8) : (UVC_VS_COMMIT_CONTROL << 8),
       ctrl->bInterfaceNumber,
-      buf, len, 0
+      buf, len, UVC_CTRL_TIMEOUT_MS /* was 0 = infinite */
   );
 
   if (err <= 0) {

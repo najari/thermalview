@@ -9,4 +9,5 @@ Only the files needed for uncompressed streaming are kept (`frame-mjpeg.c`, exam
 `claim-before-probe.patch` holds the full diff against upstream. Re-apply it when updating libuvc.
 
 1. **Claim the VS interface before the GET_MAX probe** (`uvc_get_stream_ctrl_format_size`, two places). Without it, on Windows/WinUSB the probe request goes through another interface's handle, the device STALLs and libusb's auto-release drops the claim on interface 0, so `uvc_start_streaming` fails with `Access denied`.
+3. **Control-transfer timeout** (`UVC_CTRL_TIMEOUT_MS` = 2000 in `libuvc_internal.h`, used in `ctrl.c` and the probe/commit request in `stream.c`). Upstream passes 0 (wait forever): when the PureThermal firmware stops answering an XU request, the calling thread and process exit hung forever, and the process stayed in the kernel holding the WinUSB handle until the USB cable was replugged.
 2. **`LIBUVC_TRACE` environment variable** in `stream.c`: `1` logs each assembled frame size, `2` also logs every isochronous packet. Off by default.

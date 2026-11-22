@@ -13,6 +13,10 @@
 #include <signal.h>
 #include "utlist.h"
 
+/* ThermalView patch: bound every control transfer so an unresponsive device cannot block the
+   calling thread (and process exit) forever. libuvc upstream uses 0 = no timeout. */
+#define UVC_CTRL_TIMEOUT_MS 2000
+
 /** Converts an unaligned four-byte little-endian integer into an int32 */
 #define DW_TO_INT(p) ((p)[0] | ((p)[1] << 8) | ((p)[2] << 16) | ((p)[3] << 24))
 /** Converts an unaligned two-byte little-endian integer into an int16 */
