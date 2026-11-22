@@ -2,20 +2,12 @@
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
 pub enum RangeMode {
+    #[default]
     Auto,
     /// Fixed display values (°C when radiometric).
-    Manual {
-        lo: f32,
-        hi: f32,
-    },
-}
-
-impl Default for RangeMode {
-    fn default() -> Self {
-        RangeMode::Auto
-    }
+    Manual { lo: f32, hi: f32 },
 }
 
 /// Smooths the automatic range so the colors don't flicker frame to frame.

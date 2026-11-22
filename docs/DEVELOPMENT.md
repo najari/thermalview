@@ -28,7 +28,7 @@
 | 항목 | 결정 | 이유 |
 | --- | --- | --- |
 | 언어·툴체인 | Rust stable, `x86_64-pc-windows-msvc` | 개발 PC 기본 툴체인. MinGW 불필요 |
-| UI | `eframe`/`egui` 0.37 (glow 렌더러) | 검토 결과 |
+| UI | `eframe`/`egui` 0.37 (기본 wgpu 렌더러) | 검토 결과. 0.37부터 `App::ui(&mut self, ui, frame)`와 `egui::Panel::left/top/bottom` API를 씀 |
 | 영상 수신 | 방식 1: 패치한 libuvc를 `cc`로 정적 빌드해 FFI | Windows에서 검증된 경로 |
 | libusb | `libusb1-sys`의 `vendored` 기능(정적 링크) | DLL 배포 불필요 |
 | pthread | `crates/libuvc-sys/compat/pthread.h` 자체 shim(Win32 SRWLOCK + CONDITION_VARIABLE) | libuvc가 쓰는 함수가 13개뿐 |
@@ -53,7 +53,8 @@ thermalview/
 ├─ src/
 │  ├─ main.rs                 # 진입점, 로깅, eframe 실행
 │  ├─ camera/
-│  │  ├─ mod.rs               # Camera trait, Frame 전달(최신 1장), 감시 스레드
+│  │  ├─ mod.rs               # 상수(VID/PID, 160×120)와 공개 타입
+│  │  ├─ worker.rs            # 카메라 작업 스레드: 연결·재연결, 정지 감지, 설정 재적용, 최신 1장 슬롯
 │  │  ├─ uvc.rs               # libuvc 안전 래퍼(Context/Device/Handle/Stream)
 │  │  └─ lepton.rs            # XU 명령(CCI): 명령ID → (unit, control) 변환과 타입별 get/set
 │  ├─ thermal/
@@ -77,16 +78,16 @@ thermalview/
 4. **셔터 없음.** 기본 셔터 모드는 MANUAL입니다. FFC 버튼은 "렌즈를 가렸습니까?" 확인 후에만 명령을 보냅니다. AUTO를 고르면 잔상 경고를 표시합니다.
 5. **설정 재적용.** Lepton은 리셋되면 AUTO로 돌아갑니다. 저장된 셔터 모드를 연결 직후와 3초마다 읽어 비교하고, 다르면 다시 씁니다(read-modify-write, 32바이트 객체 중 `shutterMode`만 변경).
 6. **XU 명령 매핑.** unit = 모듈(명령ID & 0x3F00): AGC 0x0100→3, SYS 0x0200→6, VID 0x0300→7, OEM 0x0800→4, RAD 0x0E00→5. control = ((명령ID & 0xFF) >> 2) + 1. Lepton enum/bool은 전송 시 4바이트. "run" 명령은 control 번호 1바이트를 SET_CUR로 보냅니다.
-7. **온도 변환.** 연결 시 RAD TLinear 활성(0x4EC0)과 해상도(0x4EC4: 0=0.1 K, 1=0.01 K)를 읽습니다. TLinear가 꺼져 있으면 온도 대신 원시값임을 화면에 표시하고 온도 측정을 비활성화합니다. 섭씨 = raw × 해상도 − 273.15.
-8. **USB 제어와 스트림의 동시성.** XU 명령은 스트리밍 중에도 같은 핸들로 보내되, 앱 전체에서 하나의 `Mutex`로 직렬화합니다.
+7. **온도 변환.** 연결 시 RAD TLinear 활성(0x4EC0)과 해상도(0x4EC4: 0=0.1 K, 1=0.01 K)를 읽습니다. TLinear가 꺼져 있으면 "원시값(온도 아님)"을 표시하고 모든 측정값을 `cnt` 단위로 보여 줍니다. 섭씨 = raw × 해상도 − 273.15.
+8. **USB 제어와 스트림의 동시성.** XU 명령은 스트리밍 중에도 같은 핸들로 보냅니다. 모든 USB 호출(스트림 시작·정지, XU 명령)은 카메라 작업 스레드 하나에서만 하고, UI는 명령 채널(`Command`)로 요청합니다. 그래서 잠금 없이 직렬화됩니다.
 9. **스트림 정지 대응.** 프레임 타임아웃(2초) → stop/start 재시도 1회 → 실패 시 핸들을 닫고 1초 간격으로 다시 찾기. DFU 직후처럼 재연결로도 회복되지 않으면 USB 재연결 안내를 띄웁니다.
 
 ## 5. 스레드와 데이터 흐름
 
 - **libuvc 콜백 스레드:** 프레임 크기(38,400바이트)와 형식을 확인하고 `Vec<u16>`으로 복사해 `Arc<Mutex<Option<ThermalFrame>>>`(최신 1장 슬롯)에 넣은 뒤 `egui::Context::request_repaint()`를 호출합니다. 콜백 안에서는 할당 외의 무거운 일을 하지 않습니다.
-- **감시 스레드:** 연결·재연결, 타임아웃 감지, 셔터 모드 재적용, 상태 폴링(1초 간격 FPA 온도 등).
-- **UI 스레드:** 슬롯에서 프레임을 가져와 통계·팔레트 변환 후 `TextureHandle::set`(NEAREST 필터)으로 갱신합니다.
-- **저장:** 스냅샷은 UI 스레드에서 프레임을 복제해 `std::thread::spawn`으로 씁니다.
+- **카메라 작업 스레드(`camera/worker.rs`):** 연결·재연결, 타임아웃 감지, 셔터 모드 재적용, 상태 폴링(1초 간격 FPA 온도 등), UI 명령 실행.
+- **UI 스레드:** 슬롯에서 프레임을 가져와 통계·팔레트 변환 후 `TextureHandle::set`(NEAREST 필터)으로 갱신합니다. 프레임이 없어도 상태 갱신을 위해 0.5초마다 다시 그립니다.
+- **저장:** 스냅샷 파일 3개는 합쳐 50 KB 정도라 UI 스레드에서 바로 씁니다. 시퀀스 녹화(단계 3)는 별도 스레드로 합니다.
 
 ## 6. 단계별 작업
 
@@ -99,6 +100,20 @@ thermalview/
 ### 단계 2 — MVP (관문: 1시간 연속 동작)
 
 F1~F9를 순서대로 구현합니다. 각 기능은 별도 커밋으로 하고, 커밋 메시지에 기능 ID를 적습니다.
+
+### 진행 현황 (2026-11-22)
+
+| 항목 | 상태 | 근거 |
+| --- | --- | --- |
+| 단계 1 관문 | 통과 | `examples/grab` 20초: 8.75 fps, 불량 프레임 0 |
+| F1 수신 | 완료 | 앱에서 8.7 fps |
+| F2 팔레트, F3 범위, F4 최고·최저 | 완료 | 화면 확인 |
+| F5 Spot 측정 | 완료 | 클릭 추가·우클릭 삭제 확인 |
+| F6 Lepton 제어 | 구현 | 셔터 모드 표시·변경, FFC 확인 대화상자. FFC 실행은 장비에서 미시험 |
+| F7 설정 유지 | 구현 | `%APPDATA%\thermalview\config.json`. 셔터 모드 3초 재적용 |
+| F8 연결 감시 | 구현, 미시험 | USB 분리·재연결 시험 필요(시험 절차 6) |
+| F9 스냅샷 | 완료 | 16비트 PNG에서 다시 계산한 Spot 값이 JSON과 소수 셋째 자리까지 일치 |
+| 1시간 연속 동작 | 진행 예정 | `examples/soak` |
 
 ### 단계 3 — 측정 도구
 

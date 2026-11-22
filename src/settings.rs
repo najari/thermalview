@@ -89,8 +89,10 @@ mod tests {
 
     #[test]
     fn roundtrip() {
-        let mut s = Settings::default();
-        s.range = RangeMode::Manual { lo: 20.0, hi: 35.0 };
+        let mut s = Settings {
+            range: RangeMode::Manual { lo: 20.0, hi: 35.0 },
+            ..Default::default()
+        };
         s.spots.add(3, 4);
         let back: Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
         assert_eq!(back.range, s.range);

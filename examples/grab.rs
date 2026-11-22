@@ -49,11 +49,7 @@ fn main() -> anyhow::Result<()> {
                 bad.fetch_add(1, Ordering::Relaxed);
                 return;
             }
-            let px: Vec<u16> = f
-                .data
-                .chunks_exact(2)
-                .map(|c| u16::from_le_bytes([c[0], c[1]]))
-                .collect();
+            let px = thermalview::thermal::frame::decode_le_u16(f.data);
             let (mn, mx) = px
                 .iter()
                 .fold((u16::MAX, 0), |(a, b), &v| (a.min(v), b.max(v)));
