@@ -15,6 +15,17 @@ pub struct SpotReading {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct ShapeReading {
+    pub label: String,
+    pub kind: String,
+    pub a: (usize, usize),
+    pub b: (usize, usize),
+    pub min: f32,
+    pub max: f32,
+    pub mean: f32,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct SnapshotMeta {
     pub app: &'static str,
     pub version: &'static str,
@@ -30,6 +41,7 @@ pub struct SnapshotMeta {
     pub palette: String,
     pub range: (f32, f32),
     pub spots: Vec<SpotReading>,
+    pub shapes: Vec<ShapeReading>,
     pub device: Option<String>,
     pub lepton_part: Option<String>,
     pub fpa_c: Option<f32>,
@@ -96,6 +108,7 @@ mod tests {
             palette: "Ironbow".into(),
             range: (0.0, 1.0),
             spots: vec![],
+            shapes: vec![],
             device: None,
             lepton_part: None,
             fpa_c: None,

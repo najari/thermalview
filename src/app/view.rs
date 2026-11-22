@@ -1,14 +1,18 @@
-//! Central image view: thermal image, color bar, extreme markers, spot meters, hover readout.
+//! Central image view: thermal image, color bar, extreme markers, measurements, hover readout.
 
-use eframe::egui::{self, pos2, vec2, Align2, Color32, FontId, Rect, Sense, Stroke};
+use eframe::egui::{self, pos2, vec2, Align2, Color32, FontId, Rect, Sense, Stroke, StrokeKind};
 
-use super::ThermalApp;
+use std::time::Instant;
+
+use super::{ThermalApp, Tool};
 use crate::thermal::measure::Spots;
+use crate::thermal::shapes::{Shape, ShapeKind, Shapes};
 
 const BAR_WIDTH: f32 = 18.0;
 const BAR_LABELS: f32 = 70.0;
+pub(super) const SHAPE_COLOR: Color32 = Color32::from_rgb(120, 255, 120);
 
-/// Draw the image view. Returns true if the spot list changed.
+/// Draw the image view. Returns true if the measurements changed.
 pub(super) fn image_view(ui: &mut egui::Ui, app: &mut ThermalApp) -> bool {
     let (Some(tex), Some(f), Some(st)) = (&app.texture, &app.frame, &app.stats) else {
         ui.centered_and_justified(|ui| {
@@ -26,7 +30,7 @@ pub(super) fn image_view(ui: &mut egui::Ui, app: &mut ThermalApp) -> bool {
     let img_size = vec2(w * scale, h * scale);
     let (resp, painter) = ui.allocate_painter(
         vec2(img_size.x + 16.0 + BAR_WIDTH + BAR_LABELS, img_size.y),
-        Sense::click(),
+        Sense::click_and_drag(),
     );
     let img_rect = Rect::from_min_size(resp.rect.min, img_size);
     painter.image(
@@ -92,6 +96,72 @@ pub(super) fn image_view(ui: &mut egui::Ui, app: &mut ThermalApp) -> bool {
         );
     }
 
+    // Boxes and lines.
+    let draw_shape = |s: &Shape, color: Color32| {
+        let shadow = Stroke::new(3.0, Color32::BLACK);
+        let line = Stroke::new(1.5, color);
+        match s.kind {
+            ShapeKind::Box => {
+                let r = Rect::from_two_pos(
+                    pos2(
+                        img_rect.min.x + s.a.0.min(s.b.0) as f32 * scale,
+                        img_rect.min.y + s.a.1.min(s.b.1) as f32 * scale,
+                    ),
+                    pos2(
+                        img_rect.min.x + (s.a.0.max(s.b.0) + 1) as f32 * scale,
+                        img_rect.min.y + (s.a.1.max(s.b.1) + 1) as f32 * scale,
+                    ),
+                );
+                painter.rect_stroke(r, 0.0, shadow, StrokeKind::Middle);
+                painter.rect_stroke(r, 0.0, line, StrokeKind::Middle);
+                r.left_top()
+            }
+            ShapeKind::Line => {
+                let (a, b) = (to_screen(s.a.0, s.a.1), to_screen(s.b.0, s.b.1));
+                painter.line_segment([a, b], shadow);
+                painter.line_segment([a, b], line);
+                for p in [a, b] {
+                    painter.circle_filled(p, 3.0, color);
+                }
+                a
+            }
+        }
+    };
+    for s in &app.settings.shapes.items {
+        let corner = draw_shape(s, SHAPE_COLOR);
+        if let Some(st) = s.stats(f) {
+            let txt = format!("{} ↑{:.1} ~{:.1}{unit}", s.label(), st.max, st.mean);
+            label(
+                &painter,
+                corner,
+                vec2(2.0, -18.0),
+                img_rect,
+                &txt,
+                &font,
+                SHAPE_COLOR,
+            );
+        }
+    }
+
+    // Shape being drawn.
+    let clamp_px = |p: egui::Pos2| -> (usize, usize) {
+        let x = ((p.x - img_rect.min.x) / scale).clamp(0.0, w - 1.0) as usize;
+        let y = ((p.y - img_rect.min.y) / scale).clamp(0.0, h - 1.0) as usize;
+        (x, y)
+    };
+    if resp.dragged() {
+        if let Some(p) = resp.interact_pointer_pos() {
+            app.drag_to = Some(clamp_px(p));
+        }
+    }
+    let preview = match (app.tool.shape_kind(), app.drag_from, app.drag_to) {
+        (Some(kind), Some(a), Some(b)) => Some(Shape { id: 0, kind, a, b }),
+        _ => None,
+    };
+    if let Some(s) = &preview {
+        draw_shape(s, Color32::YELLOW);
+    }
+
     // Hover readout.
     if let Some((x, y)) = resp.hover_pos().and_then(to_pixel) {
         let txt = format!("({x}, {y})  {:.2} {unit}", f.value(f.at(x, y)));
@@ -147,20 +217,48 @@ pub(super) fn image_view(ui: &mut egui::Ui, app: &mut ThermalApp) -> bool {
         );
     }
 
-    // Clicks: left adds a spot, right removes the nearest one.
+    // Pointer: Spot tool clicks add spots; Box/Line tools drag to draw; right-click deletes
+    // the nearest spot or shape.
     let mut changed = false;
+    if resp.drag_started() && app.tool.shape_kind().is_some() {
+        app.drag_from = ui.input(|i| i.pointer.press_origin()).and_then(to_pixel);
+        app.drag_to = app.drag_from;
+    }
+    if resp.drag_stopped() {
+        if let Some(s) = preview {
+            if s.a != s.b {
+                if app.settings.shapes.add(s.kind, s.a, s.b).is_none() {
+                    app.message = Some((
+                        format!("영역·선은 최대 {}개입니다", Shapes::MAX),
+                        Instant::now(),
+                    ));
+                }
+                changed = true;
+            }
+        }
+        app.drag_from = None;
+        app.drag_to = None;
+    }
     if let Some(p) = resp.interact_pointer_pos() {
         let px = (p.x - img_rect.min.x) / scale;
         let py = (p.y - img_rect.min.y) / scale;
         if resp.secondary_clicked() {
-            if let Some(id) = app.settings.spots.hit(px, py, 6.0) {
-                app.settings.spots.remove(id);
-                changed = true;
+            let tol = 6.0;
+            let spot = app.settings.spots.hit(px, py, tol);
+            let shape = app.settings.shapes.hit(px, py, tol);
+            match (spot, shape) {
+                (Some(id), _) => app.settings.spots.remove(id),
+                (None, Some(id)) => app.settings.shapes.remove(id),
+                _ => {}
             }
-        } else if resp.clicked() {
+            changed |= spot.is_some() || shape.is_some();
+        } else if resp.clicked() && app.tool == Tool::Spot {
             if let Some((x, y)) = to_pixel(p) {
                 if app.settings.spots.add(x, y).is_none() {
-                    app.notify(format!("측정점은 최대 {}개입니다", Spots::MAX));
+                    app.message = Some((
+                        format!("측정점은 최대 {}개입니다", Spots::MAX),
+                        Instant::now(),
+                    ));
                 }
                 changed = true;
             }

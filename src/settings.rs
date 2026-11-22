@@ -8,6 +8,7 @@ use crate::camera::lepton::ShutterMode;
 use crate::thermal::measure::Spots;
 use crate::thermal::palette::Palette;
 use crate::thermal::range::RangeMode;
+use crate::thermal::shapes::Shapes;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -17,6 +18,8 @@ pub struct Settings {
     pub palette: Palette,
     pub range: RangeMode,
     pub spots: Spots,
+    /// Box and Line measurements.
+    pub shapes: Shapes,
     pub show_extremes: bool,
     pub snapshot_dir: Option<PathBuf>,
 }
@@ -28,6 +31,7 @@ impl Default for Settings {
             palette: Palette::default(),
             range: RangeMode::default(),
             spots: Spots::default(),
+            shapes: Shapes::default(),
             show_extremes: true,
             snapshot_dir: None,
         }

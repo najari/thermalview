@@ -5,11 +5,13 @@ use egui_plot::{Bar, BarChart, Legend, Line, Plot};
 
 use super::ThermalApp;
 use crate::thermal::histogram::Histogram;
+use crate::thermal::shapes::ShapeKind;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
     Time,
     Histogram,
+    Profile,
 }
 
 pub struct GraphState {
@@ -56,6 +58,7 @@ pub(super) fn show(ui: &mut egui::Ui, app: &mut ThermalApp) {
     ui.horizontal(|ui| {
         ui.selectable_value(&mut g.tab, Tab::Time, "시간 그래프");
         ui.selectable_value(&mut g.tab, Tab::Histogram, "히스토그램");
+        ui.selectable_value(&mut g.tab, Tab::Profile, "선 프로파일");
         ui.separator();
         if g.tab == Tab::Time {
             for (secs, label) in [(60.0, "1분"), (300.0, "5분"), (1800.0, "30분")] {
@@ -75,7 +78,44 @@ pub(super) fn show(ui: &mut egui::Ui, app: &mut ThermalApp) {
     match app.graphs.tab {
         Tab::Time => time_plot(ui, app, unit),
         Tab::Histogram => histogram_plot(ui, app, unit),
+        Tab::Profile => profile_plot(ui, app, unit),
     }
+}
+
+fn profile_plot(ui: &mut egui::Ui, app: &ThermalApp, unit: &str) {
+    let Some(f) = &app.frame else {
+        ui.label("영상이 없습니다");
+        return;
+    };
+    let lines: Vec<Line<'static>> = app
+        .settings
+        .shapes
+        .items
+        .iter()
+        .filter(|s| s.kind == ShapeKind::Line)
+        .enumerate()
+        .map(|(i, s)| {
+            Line::new(s.label(), s.profile(f))
+                .color(SPOT_COLORS[i % SPOT_COLORS.len()])
+                .width(1.5)
+        })
+        .collect();
+    if lines.is_empty() {
+        ui.label(
+            "측정 도구에서 '선'을 고르고 영상 위를 드래그하면 선을 따라 온도 변화가 표시됩니다.",
+        );
+        return;
+    }
+    Plot::new("profile")
+        .legend(Legend::default())
+        .x_axis_label("거리 (화소)")
+        .y_axis_label(unit.to_string())
+        .allow_scroll(false)
+        .show(ui, |plot_ui| {
+            for l in lines {
+                plot_ui.line(l);
+            }
+        });
 }
 
 fn time_plot(ui: &mut egui::Ui, app: &ThermalApp, unit: &str) {

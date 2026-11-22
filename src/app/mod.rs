@@ -11,11 +11,30 @@ use crate::camera::lepton::ShutterMode;
 use crate::camera::{Camera, CameraStatus, Command, ConnState};
 use crate::settings::Settings;
 use crate::storage::csv_log::{self, CsvLog};
-use crate::storage::snapshot::{self, SnapshotMeta, SpotReading};
+use crate::storage::snapshot::{self, ShapeReading, SnapshotMeta, SpotReading};
 use crate::thermal::frame::{FrameStats, ThermalFrame};
 use crate::thermal::history::{History, Sample};
 use crate::thermal::palette::{self, Palette};
 use crate::thermal::range::{AutoRange, RangeMode};
+use crate::thermal::shapes::ShapeKind;
+
+/// What a left click / drag on the image does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tool {
+    Spot,
+    Box,
+    Line,
+}
+
+impl Tool {
+    fn shape_kind(self) -> Option<ShapeKind> {
+        match self {
+            Tool::Spot => None,
+            Tool::Box => Some(ShapeKind::Box),
+            Tool::Line => Some(ShapeKind::Line),
+        }
+    }
+}
 
 pub struct ThermalApp {
     camera: Camera,
@@ -39,6 +58,11 @@ pub struct ThermalApp {
     graphs: graphs::GraphState,
     csv: Option<CsvLog>,
     last_fpa: Option<f32>,
+
+    tool: Tool,
+    /// Pixel where the current Box/Line drag started, and where it is now.
+    drag_from: Option<(usize, usize)>,
+    drag_to: Option<(usize, usize)>,
 }
 
 impl ThermalApp {
@@ -66,6 +90,9 @@ impl ThermalApp {
             graphs: graphs::GraphState::default(),
             csv: None,
             last_fpa: None,
+            tool: Tool::Spot,
+            drag_from: None,
+            drag_to: None,
         }
     }
 
@@ -220,6 +247,23 @@ impl ThermalApp {
                         x: s.x,
                         y: s.y,
                         value,
+                    })
+                })
+                .collect(),
+            shapes: self
+                .settings
+                .shapes
+                .items
+                .iter()
+                .filter_map(|s| {
+                    s.stats(f).map(|st| ShapeReading {
+                        label: s.label(),
+                        kind: format!("{:?}", s.kind),
+                        a: s.a,
+                        b: s.b,
+                        min: st.min,
+                        max: st.max,
+                        mean: st.mean,
                     })
                 })
                 .collect(),
@@ -385,7 +429,16 @@ impl ThermalApp {
 
             ui.separator();
             ui.heading("측정");
-            ui.label("영상 클릭: 측정점 추가 · 우클릭: 삭제");
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.tool, Tool::Spot, "⊙ 점");
+                ui.selectable_value(&mut self.tool, Tool::Box, "▭ 영역");
+                ui.selectable_value(&mut self.tool, Tool::Line, "╱ 선");
+            });
+            ui.label(match self.tool {
+                Tool::Spot => "영상 클릭: 측정점 추가 · 우클릭: 삭제",
+                Tool::Box => "드래그: 영역 그리기 · 우클릭: 삭제",
+                Tool::Line => "드래그: 선 그리기 · 우클릭: 삭제",
+            });
             if let (Some(f), Some(st)) = (&self.frame, &self.stats) {
                 egui::Grid::new("stats").num_columns(2).show(ui, |ui| {
                     ui.label("최고");
@@ -425,9 +478,32 @@ impl ThermalApp {
                 self.settings.spots.remove(id);
                 self.mark_dirty();
             }
-            if !self.settings.spots.items.is_empty() && ui.button("측정점 모두 삭제").clicked()
-            {
+            let mut remove_shape = None;
+            for s in &self.settings.shapes.items {
+                let st = self.frame.as_ref().and_then(|f| s.stats(f));
+                ui.horizontal(|ui| {
+                    ui.colored_label(view::SHAPE_COLOR, s.label());
+                    match st {
+                        Some(st) => ui.label(format!(
+                            "↑{:.1} ↓{:.1} ~{:.1} {unit}",
+                            st.max, st.min, st.mean
+                        )),
+                        None => ui.label("-"),
+                    };
+                    if ui.small_button("✕").clicked() {
+                        remove_shape = Some(s.id);
+                    }
+                });
+            }
+            if let Some(id) = remove_shape {
+                self.settings.shapes.remove(id);
+                self.mark_dirty();
+            }
+            let any =
+                !self.settings.spots.items.is_empty() || !self.settings.shapes.items.is_empty();
+            if any && ui.button("측정 모두 삭제").clicked() {
                 self.settings.spots.clear();
+                self.settings.shapes.clear();
                 self.mark_dirty();
             }
         });

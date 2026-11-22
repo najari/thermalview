@@ -6,5 +6,6 @@ pub mod history;
 pub mod measure;
 pub mod palette;
 pub mod range;
+pub mod shapes;
 
 pub use frame::{FrameStats, ThermalFrame};
