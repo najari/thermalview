@@ -1,6 +1,7 @@
 //! eframe application: image view, control panel, status bar.
 
 mod graphs;
+mod playback;
 mod view;
 
 use std::time::{Duration, Instant};
@@ -11,6 +12,7 @@ use crate::camera::lepton::ShutterMode;
 use crate::camera::{Camera, CameraStatus, Command, ConnState};
 use crate::settings::Settings;
 use crate::storage::csv_log::{self, CsvLog};
+use crate::storage::sequence::{self, SeqHeader, SeqWriter};
 use crate::storage::snapshot::{self, ShapeReading, SnapshotMeta, SpotReading};
 use crate::thermal::frame::{FrameStats, ThermalFrame};
 use crate::thermal::history::{History, Sample};
@@ -63,6 +65,12 @@ pub struct ThermalApp {
     /// Pixel where the current Box/Line drag started, and where it is now.
     drag_from: Option<(usize, usize)>,
     drag_to: Option<(usize, usize)>,
+
+    /// Radiometric sequence recording (live only).
+    seq: Option<SeqWriter>,
+    /// When set, the image comes from a recorded sequence instead of the camera.
+    player: Option<playback::Player>,
+    show_open_dialog: bool,
 }
 
 impl ThermalApp {
@@ -93,7 +101,100 @@ impl ThermalApp {
             tool: Tool::Spot,
             drag_from: None,
             drag_to: None,
+            seq: None,
+            player: None,
+            show_open_dialog: false,
         }
+    }
+
+    fn toggle_seq(&mut self, status: &CameraStatus) {
+        if let Some(w) = self.seq.take() {
+            match w.finish() {
+                Ok((path, n)) => self.notify(format!("녹화 종료: {n}프레임 → {}", path.display())),
+                Err(e) => self.notify(format!("녹화 파일 저장 실패: {e}")),
+            }
+            return;
+        }
+        let Some(f) = &self.frame else {
+            return;
+        };
+        let header = SeqHeader {
+            width: f.width,
+            height: f.height,
+            kelvin_per_count: f.kelvin_per_count,
+            started_local: chrono::Local::now().to_rfc3339(),
+            device: status.device.as_ref().map(|d| d.product.clone()),
+        };
+        match SeqWriter::start(&self.settings.snapshot_dir(), header) {
+            Ok(w) => {
+                self.notify(format!("녹화 시작: {}", w.path().display()));
+                self.seq = Some(w);
+            }
+            Err(e) => self.notify(format!("녹화 파일을 만들 수 없습니다: {e}")),
+        }
+    }
+
+    fn open_sequence(&mut self, path: &std::path::Path) {
+        match playback::Player::open(path) {
+            Ok(p) => {
+                if let Some(w) = self.seq.take() {
+                    let _ = w.finish();
+                }
+                self.history.clear();
+                self.auto_range.reset();
+                self.notify(format!("재생: {}", p.file_name()));
+                self.player = Some(p);
+            }
+            Err(e) => self.notify(format!("열 수 없습니다: {e}")),
+        }
+    }
+
+    fn close_player(&mut self) {
+        self.player = None;
+        self.history.clear();
+        self.auto_range.reset();
+        self.started = Instant::now();
+    }
+
+    fn open_dialog(&mut self, ctx: &egui::Context) {
+        if !self.show_open_dialog {
+            return;
+        }
+        let dir = self.settings.snapshot_dir();
+        let files = sequence::list(&dir);
+        let mut chosen = None;
+        let mut open = true;
+        egui::Window::new("녹화 파일 열기")
+            .open(&mut open)
+            .collapsible(false)
+            .default_width(420.0)
+            .show(ctx, |ui| {
+                ui.label(format!("폴더: {}", dir.display()));
+                ui.separator();
+                if files.is_empty() {
+                    ui.label("녹화 파일(.tvseq)이 없습니다. 실시간 화면에서 '⏺ 녹화'로 만드세요.");
+                }
+                egui::ScrollArea::vertical()
+                    .max_height(300.0)
+                    .show(ui, |ui| {
+                        for (path, bytes) in &files {
+                            let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
+                            let text = format!(
+                                "{}  ({:.1} MB)",
+                                name.unwrap_or_default(),
+                                *bytes as f64 / 1e6
+                            );
+                            if ui.button(text).clicked() {
+                                chosen = Some(path.clone());
+                            }
+                        }
+                    });
+            });
+        if let Some(p) = chosen {
+            self.open_sequence(&p);
+            open = false;
+        }
+        self.show_open_dialog = open;
     }
 
     /// Current spot readings as (id, value).
@@ -106,14 +207,15 @@ impl ThermalApp {
             .collect()
     }
 
-    /// Append the newest frame to the time series and, if recording, to the CSV log.
-    fn record(&mut self) {
+    /// Append the newest frame (taken at `t` seconds) to the time series and, if recording,
+    /// to the CSV log.
+    fn record(&mut self, t: f64) {
         let (Some(f), Some(st)) = (&self.frame, &self.stats) else {
             return;
         };
         let spots = self.spot_values(f);
         let sample = Sample {
-            t: self.started.elapsed().as_secs_f64(),
+            t,
             max: f.value(st.max),
             min: f.value(st.min),
             mean: value_of_mean(f, st.mean),
@@ -183,14 +285,34 @@ impl ThermalApp {
         }
     }
 
-    /// Pull the newest frame from the camera and re-render the texture.
+    /// Pull the newest frame (from the camera, or the player during playback) and re-render.
     fn update_frame(&mut self, ctx: &egui::Context) {
-        if let Some(f) = self.camera.take_frame() {
-            self.stats = Some(f.stats());
-            self.frame = Some(f);
-            self.render(ctx);
-            self.record();
-        }
+        let live = self.camera.take_frame();
+        let (f, t) = if let Some(p) = &mut self.player {
+            // Live frames are dropped during playback; the camera stays connected.
+            match p.tick() {
+                Ok(Some((t_ms, f))) => (f, t_ms as f64 / 1000.0),
+                Ok(None) => return,
+                Err(e) => {
+                    let msg = format!("재생 오류: {e}");
+                    self.close_player();
+                    self.notify(msg);
+                    return;
+                }
+            }
+        } else {
+            let Some(f) = live else {
+                return;
+            };
+            if let Some(w) = &mut self.seq {
+                w.push(&f);
+            }
+            (f, self.started.elapsed().as_secs_f64())
+        };
+        self.stats = Some(f.stats());
+        self.frame = Some(f);
+        self.render(ctx);
+        self.record(t);
     }
 
     /// Recolor the current frame (after a new frame or a palette/range change).
@@ -572,6 +694,30 @@ impl eframe::App for ThermalApp {
                 {
                     self.toggle_csv();
                 }
+                ui.separator();
+                let seq_label = match &self.seq {
+                    Some(w) => format!(
+                        "⏹ 녹화 중지 ({:.0}초, {:.0} MB)",
+                        w.elapsed_secs(),
+                        w.bytes() as f64 / 1e6
+                    ),
+                    None => "⏺ 녹화".to_string(),
+                };
+                let can_record =
+                    self.player.is_none() && (self.frame.is_some() || self.seq.is_some());
+                if ui
+                    .add_enabled(
+                        can_record,
+                        egui::Button::new(seq_label).selected(self.seq.is_some()),
+                    )
+                    .on_hover_text("모든 프레임의 온도 원본을 .tvseq 파일로 녹화 (약 1.2 GB/시간)")
+                    .clicked()
+                {
+                    self.toggle_seq(&status);
+                }
+                if ui.button("▶ 재생…").clicked() {
+                    self.show_open_dialog = true;
+                }
                 if ui.button("📁 저장 폴더").clicked() {
                     let dir = self.settings.snapshot_dir();
                     let _ = std::fs::create_dir_all(&dir);
@@ -581,6 +727,21 @@ impl eframe::App for ThermalApp {
                 ui.toggle_value(&mut self.graphs.visible, "📈 그래프");
             });
         });
+
+        let mut close_player = false;
+        if let Some(p) = &mut self.player {
+            egui::Panel::bottom("playback").show(ui, |ui| match p.ui(ui) {
+                Ok(playback::PlayerAction::Close) => close_player = true,
+                Ok(playback::PlayerAction::None) => {}
+                Err(e) => {
+                    log::warn!("playback error: {e}");
+                    close_player = true;
+                }
+            });
+        }
+        if close_player {
+            self.close_player();
+        }
 
         egui::Panel::bottom("status").show(ui, |ui| {
             ui.horizontal(|ui| {
@@ -617,6 +778,7 @@ impl eframe::App for ThermalApp {
         });
 
         self.ffc_dialog(&ctx);
+        self.open_dialog(&ctx);
         self.save_settings_if_due(false);
         // Keep status fresh even when no frames arrive (disconnected / stalled).
         ctx.request_repaint_after(Duration::from_millis(500));
@@ -626,6 +788,9 @@ impl eframe::App for ThermalApp {
         self.save_settings_if_due(true);
         if let Some(log) = self.csv.take() {
             let _ = log.finish();
+        }
+        if let Some(w) = self.seq.take() {
+            let _ = w.finish();
         }
     }
 }
