@@ -29,6 +29,7 @@
 | --- | --- | --- |
 | 언어·툴체인 | Rust stable, `x86_64-pc-windows-msvc` | 개발 PC 기본 툴체인. MinGW 불필요 |
 | UI | `eframe`/`egui` 0.37 (기본 wgpu 렌더러) | 검토 결과. 0.37부터 `App::ui(&mut self, ui, frame)`와 `egui::Panel::left/top/bottom` API를 씀 |
+| 창 시스템 | `crates/winit`: winit 0.30.13에 DPI 패치 1건 적용(`[patch.crates-io]`) | 배율이 다른 모니터로 끌면 창이 커지며 넘어가지 못하는 버그. 수정이 winit 0.31에만 있고 eframe 0.37은 0.30을 씀. eframe이 winit 0.31 이상을 쓰면 제거(`crates/winit/PATCHES.md`) |
 | 영상 수신 | 방식 1: 패치한 libuvc를 `cc`로 정적 빌드해 FFI | Windows에서 검증된 경로 |
 | libusb | `libusb1-sys`의 `vendored` 기능(정적 링크) | DLL 배포 불필요 |
 | pthread | `crates/libuvc-sys/compat/pthread.h` 자체 shim(Win32 SRWLOCK + CONDITION_VARIABLE) | libuvc가 쓰는 함수가 13개뿐 |
@@ -45,11 +46,12 @@
 thermalview/
 ├─ Cargo.toml                 # workspace + 앱 크레이트
 ├─ crates/
-│  └─ libuvc-sys/             # FFI 계층 (unsafe는 여기와 src/camera/에만)
-│     ├─ build.rs             # libuvc C 소스 + shim 컴파일, libusb1-sys에 링크
-│     ├─ compat/              # pthread.h, sys/time.h shim (MSVC 전용)
-│     ├─ vendor/libuvc/       # GetThermal 세션에서 패치한 libuvc (BSD, LICENSE.txt 유지)
-│     └─ src/lib.rs           # extern "C" 선언과 구조체
+│  ├─ libuvc-sys/             # FFI 계층 (unsafe는 여기와 src/camera/에만)
+│  │  ├─ build.rs             # libuvc C 소스 + shim 컴파일, libusb1-sys에 링크
+│  │  ├─ compat/              # pthread.h, sys/time.h shim (MSVC 전용)
+│  │  ├─ vendor/libuvc/       # GetThermal 세션에서 패치한 libuvc (BSD, LICENSE.txt 유지)
+│  │  └─ src/lib.rs           # extern "C" 선언과 구조체
+│  └─ winit/                  # 패치한 winit 0.30.13 (Apache-2.0, 변경 내용은 PATCHES.md)
 ├─ src/
 │  ├─ main.rs                 # 진입점, 로깅, eframe 실행
 │  ├─ camera/
@@ -136,7 +138,7 @@ v2 압축과 드래그 편집은 위 자동 시험으로 확인했고, 앱 화�
 
 ## 7. 코드 규칙
 
-- `unsafe`는 `crates/libuvc-sys`와 `src/camera/uvc.rs`에만 둡니다. 각 `unsafe` 블록 위에 안전 조건을 주석으로 적습니다.
+- `unsafe`는 `crates/libuvc-sys`와 `src/camera/uvc.rs`에만 둡니다. 각 `unsafe` 블록 위에 안전 조건을 주석으로 적습니다. 외부 코드를 그대로 가져온 `crates/winit`은 이 규칙의 대상이 아닙니다.
 - 캡처·제어 경로에서 `unwrap`/`expect` 금지. 오류는 `anyhow::Result` 또는 전용 오류 타입으로 UI까지 올려 상태 줄에 표시합니다.
 - `thermal/` 모듈은 장치 없이 테스트할 수 있어야 합니다(순수 함수). 팔레트, 범위, 통계, Spot 계산에 단위 테스트를 둡니다.
 - 커밋 전: `cargo fmt`, `cargo clippy --all-targets`(경고 0 목표), `cargo test`.

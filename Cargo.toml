@@ -1,5 +1,11 @@
 [workspace]
 members = [".", "crates/libuvc-sys"]
+exclude = ["crates/winit"]
+
+# Fixes window growth when dragging across monitors with different DPI.
+# See crates/winit/PATCHES.md. Remove once eframe uses winit 0.31 or later.
+[patch.crates-io]
+winit = { path = "crates/winit" }
 
 [package]
 name = "thermalview"
