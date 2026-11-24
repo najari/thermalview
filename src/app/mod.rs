@@ -1,5 +1,6 @@
 //! eframe application: image view, control panel, status bar.
 
+mod alarms;
 mod graphs;
 mod playback;
 mod view;
@@ -89,6 +90,8 @@ pub struct ThermalApp {
     /// When set, the image comes from a recorded sequence instead of the camera.
     player: Option<playback::Player>,
     show_open_dialog: bool,
+
+    alarms: alarms::AlarmState,
 }
 
 impl ThermalApp {
@@ -125,6 +128,7 @@ impl ThermalApp {
             seq: None,
             player: None,
             show_open_dialog: false,
+            alarms: alarms::AlarmState::default(),
         }
     }
 
@@ -322,24 +326,24 @@ impl ThermalApp {
     }
 
     /// Pull the newest frame (from the camera, or the player during playback) and re-render.
-    fn update_frame(&mut self, ctx: &egui::Context) {
+    /// Returns the frame time if a new *live* frame arrived.
+    fn update_frame(&mut self, ctx: &egui::Context) -> Option<f64> {
         let live = self.camera.take_frame();
+        let is_live = self.player.is_none();
         let (f, t) = if let Some(p) = &mut self.player {
             // Live frames are dropped during playback; the camera stays connected.
             match p.tick() {
                 Ok(Some((t_ms, f))) => (f, t_ms as f64 / 1000.0),
-                Ok(None) => return,
+                Ok(None) => return None,
                 Err(e) => {
                     let msg = format!("재생 오류: {e}");
                     self.close_player();
                     self.notify(msg);
-                    return;
+                    return None;
                 }
             }
         } else {
-            let Some(f) = live else {
-                return;
-            };
+            let f = live?;
             if let Some(w) = &mut self.seq {
                 w.push(&f);
             }
@@ -349,6 +353,7 @@ impl ThermalApp {
         self.frame = Some(f);
         self.render(ctx);
         self.record(t);
+        is_live.then_some(t)
     }
 
     /// Recolor the current frame (after a new frame or a palette/range change).
@@ -664,6 +669,9 @@ impl ThermalApp {
                 self.settings.shapes.clear();
                 self.mark_dirty();
             }
+
+            ui.separator();
+            alarms::controls(ui, self);
         });
     }
 
@@ -702,9 +710,10 @@ impl ThermalApp {
 impl eframe::App for ThermalApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
-        self.update_frame(&ctx);
+        let new_live = self.update_frame(&ctx);
         let status = self.camera.status();
         self.last_fpa = status.fpa_c;
+        alarms::update(self, &ctx, &status, new_live);
 
         egui::Panel::top("toolbar").show(ui, |ui| {
             ui.horizontal(|ui| {
@@ -765,6 +774,7 @@ impl eframe::App for ThermalApp {
                 ui.toggle_value(&mut self.graphs.visible, "📈 그래프");
             });
         });
+        alarms::banner(ui, self);
 
         let mut close_player = false;
         if let Some(p) = &mut self.player {

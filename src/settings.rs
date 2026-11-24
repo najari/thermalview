@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::camera::lepton::ShutterMode;
+use crate::thermal::alarm::AlarmConfig;
 use crate::thermal::measure::Spots;
 use crate::thermal::palette::Palette;
 use crate::thermal::range::RangeMode;
@@ -20,6 +21,7 @@ pub struct Settings {
     pub spots: Spots,
     /// Box and Line measurements.
     pub shapes: Shapes,
+    pub alarms: AlarmConfig,
     pub show_extremes: bool,
     pub snapshot_dir: Option<PathBuf>,
 }
@@ -32,6 +34,7 @@ impl Default for Settings {
             range: RangeMode::default(),
             spots: Spots::default(),
             shapes: Shapes::default(),
+            alarms: AlarmConfig::default(),
             show_extremes: true,
             snapshot_dir: None,
         }
