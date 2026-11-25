@@ -59,6 +59,8 @@ pub struct CameraStatus {
     pub part_number: Option<String>,
     pub lepton_sw: Option<String>,
     pub kelvin_per_count: Option<f32>,
+    /// Scene emissivity configured inside the Lepton (read once per connection).
+    pub camera_emissivity: Option<f32>,
     pub fpa_c: Option<f32>,
     pub shutter_mode: Option<ShutterMode>,
     pub since_ffc_s: Option<f32>,
@@ -272,6 +274,7 @@ fn start_stream(h: &mut Handle, shared: &Arc<Shared>, scale: Option<f32>) -> Res
             kelvin_per_count: scale,
             sequence: f.sequence,
             captured: SystemTime::now(),
+            calibration: None,
         };
         if let Ok(mut l) = s.latest.lock() {
             *l = Some(frame);
@@ -309,11 +312,23 @@ fn session(
     let scale = lepton::tlinear_scale(&h).ok().flatten();
     let part = lepton::part_number(&h).ok();
     let sw = lepton::software_version(&h).ok();
+    // Connect-time only, outside the polling budget (§4.10).
+    let cam_eps = match lepton::scene_emissivity(&h) {
+        Ok(e) => {
+            log::info!("Lepton scene emissivity {e:.3}");
+            Some(e)
+        }
+        Err(e) => {
+            log::warn!("could not read RAD flux parameters: {e}");
+            None
+        }
+    };
     if let Err(e) = enforce_mode(&h, *desired) {
         log::warn!("could not apply shutter mode: {e}");
     }
     shared.status(|s| {
         s.kelvin_per_count = scale;
+        s.camera_emissivity = cam_eps;
         s.part_number = part;
         s.lepton_sw = sw;
         s.last_error = None;

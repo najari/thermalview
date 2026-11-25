@@ -1,6 +1,9 @@
 //! Radiometric frame: raw Lepton counts plus the scale needed to turn them into temperatures.
 
+use std::sync::Arc;
 use std::time::SystemTime;
+
+use super::calibration::CalTable;
 
 #[derive(Debug, Clone)]
 pub struct ThermalFrame {
@@ -12,6 +15,8 @@ pub struct ThermalFrame {
     pub kelvin_per_count: Option<f32>,
     pub sequence: u32,
     pub captured: SystemTime,
+    /// Temperature correction for display values (radiometric frames only). `raw` is unchanged.
+    pub calibration: Option<Arc<CalTable>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -39,6 +44,7 @@ impl ThermalFrame {
             kelvin_per_count,
             sequence: 0,
             captured: SystemTime::now(),
+            calibration: None,
         }
     }
 
@@ -46,16 +52,39 @@ impl ThermalFrame {
         self.kelvin_per_count.is_some()
     }
 
-    /// Display value of a raw count: °C when radiometric, otherwise the count itself.
+    fn table(&self) -> Option<&CalTable> {
+        self.kelvin_per_count.and(self.calibration.as_deref())
+    }
+
+    /// Display value of a raw count: corrected °C when radiometric, otherwise the count itself.
     pub fn value(&self, raw: u16) -> f32 {
-        match self.kelvin_per_count {
-            Some(k) => raw as f32 * k - 273.15,
-            None => raw as f32,
+        if let Some(t) = self.table() {
+            return t.value(raw);
         }
+        self.value_f(raw as f32)
+    }
+
+    /// Display value of a fractional raw count, such as a mean over pixels.
+    pub fn value_f(&self, raw: f32) -> f32 {
+        if let Some(t) = self.table() {
+            return t.value_f(raw);
+        }
+        match self.kelvin_per_count {
+            Some(k) => raw * k - 273.15,
+            None => raw,
+        }
+    }
+
+    /// Camera reading in °C before any correction (`None` for raw counts).
+    pub fn apparent_c(&self, raw: f32) -> Option<f32> {
+        self.kelvin_per_count.map(|k| raw * k - 273.15)
     }
 
     /// Inverse of [`Self::value`], clamped to the u16 range.
     pub fn raw_from_value(&self, v: f32) -> u16 {
+        if let Some(t) = self.table() {
+            return t.raw_from_value(v);
+        }
         let r = match self.kelvin_per_count {
             Some(k) => (v + 273.15) / k,
             None => v,
@@ -120,11 +149,7 @@ impl ThermalFrame {
 
     /// Display value (°C or counts) of the mean around (x, y).
     pub fn value_around(&self, x: usize, y: usize, r: usize) -> f32 {
-        let m = self.mean_around(x, y, r);
-        match self.kelvin_per_count {
-            Some(k) => m * k - 273.15,
-            None => m,
-        }
+        self.value_f(self.mean_around(x, y, r))
     }
 }
 
@@ -152,6 +177,27 @@ mod tests {
         let counts = ThermalFrame::new(2, 2, vec![5; 4], None);
         assert_eq!(counts.value(5), 5.0);
         assert_eq!(counts.unit(), "cnt");
+    }
+
+    #[test]
+    fn calibration_applies_to_values_not_raw() {
+        use crate::thermal::calibration::Calibration;
+        let mut f = frame(vec![29315; 4], 2, 2);
+        let mut cal = Calibration::default();
+        cal.add_ref(20.0, 21.0).unwrap();
+        f.calibration = Some(Arc::new(CalTable::new(0.01, &cal)));
+        assert!((f.value(29315) - 21.0).abs() < 1e-3);
+        assert!((f.value_around(0, 0, 1) - 21.0).abs() < 1e-3);
+        assert_eq!(
+            f.apparent_c(29315.0).map(|v| (v * 100.0).round()),
+            Some(2000.0)
+        );
+        assert_eq!(f.raw_from_value(21.0), 29315);
+        assert_eq!(f.raw, vec![29315; 4]);
+        // Raw counts ignore a table.
+        let mut counts = ThermalFrame::new(2, 2, vec![5; 4], None);
+        counts.calibration = f.calibration.clone();
+        assert_eq!(counts.value(5), 5.0);
     }
 
     #[test]

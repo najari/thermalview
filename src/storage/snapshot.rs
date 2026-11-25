@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
+use crate::thermal::calibration::Calibration;
 use crate::thermal::frame::ThermalFrame;
 
 #[derive(Debug, Clone, Serialize)]
@@ -46,6 +47,9 @@ pub struct SnapshotMeta {
     pub lepton_part: Option<String>,
     pub fpa_c: Option<f32>,
     pub shutter_mode: Option<String>,
+    /// Correction applied to every temperature above; `null` when none. The 16-bit PNG holds the
+    /// camera's uncorrected counts.
+    pub calibration: Option<Calibration>,
 }
 
 pub struct SnapshotFiles {
@@ -113,6 +117,7 @@ mod tests {
             lepton_part: None,
             fpa_c: None,
             shutter_mode: None,
+            calibration: None,
         };
         let files = save(&dir, &frame, &rgba, &meta).unwrap();
         let back = image::open(&files.raw_png).unwrap().into_luma16();

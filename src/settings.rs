@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::camera::lepton::ShutterMode;
 use crate::thermal::alarm::AlarmConfig;
+use crate::thermal::calibration::Calibration;
 use crate::thermal::measure::Spots;
 use crate::thermal::palette::Palette;
 use crate::thermal::range::RangeMode;
@@ -22,6 +23,8 @@ pub struct Settings {
     /// Box and Line measurements.
     pub shapes: Shapes,
     pub alarms: AlarmConfig,
+    /// Emissivity, reflected temperature and reference correction.
+    pub calibration: Calibration,
     pub show_extremes: bool,
     pub snapshot_dir: Option<PathBuf>,
 }
@@ -35,6 +38,7 @@ impl Default for Settings {
             spots: Spots::default(),
             shapes: Shapes::default(),
             alarms: AlarmConfig::default(),
+            calibration: Calibration::default(),
             show_extremes: true,
             snapshot_dir: None,
         }

@@ -1,6 +1,7 @@
 //! eframe application: image view, control panel, status bar.
 
 mod alarms;
+mod calibration;
 mod graphs;
 mod playback;
 mod view;
@@ -92,6 +93,7 @@ pub struct ThermalApp {
     show_open_dialog: bool,
 
     alarms: alarms::AlarmState,
+    cal: calibration::CalState,
 }
 
 impl ThermalApp {
@@ -129,6 +131,7 @@ impl ThermalApp {
             player: None,
             show_open_dialog: false,
             alarms: alarms::AlarmState::default(),
+            cal: calibration::CalState::default(),
         }
     }
 
@@ -243,7 +246,7 @@ impl ThermalApp {
             t,
             max: f.value(st.max),
             min: f.value(st.min),
-            mean: value_of_mean(f, st.mean),
+            mean: f.value_f(st.mean),
             center: f.value_around(f.width / 2, f.height / 2, 1),
         };
         let ids: Vec<u32> = spots.iter().map(|(id, _)| *id).collect();
@@ -330,7 +333,7 @@ impl ThermalApp {
     fn update_frame(&mut self, ctx: &egui::Context) -> Option<f64> {
         let live = self.camera.take_frame();
         let is_live = self.player.is_none();
-        let (f, t) = if let Some(p) = &mut self.player {
+        let (mut f, t) = if let Some(p) = &mut self.player {
             // Live frames are dropped during playback; the camera stays connected.
             match p.tick() {
                 Ok(Some((t_ms, f))) => (f, t_ms as f64 / 1000.0),
@@ -349,6 +352,7 @@ impl ThermalApp {
             }
             (f, self.started.elapsed().as_secs_f64())
         };
+        calibration::attach(self, &mut f);
         self.stats = Some(f.stats());
         self.frame = Some(f);
         self.render(ctx);
@@ -396,7 +400,7 @@ impl ThermalApp {
             unit: f.unit(),
             min: f.value(st.min),
             max: f.value(st.max),
-            mean: f.value(st.mean.round() as u16),
+            mean: f.value_f(st.mean),
             palette: self.settings.palette.label().to_string(),
             range: self.display_range,
             spots: self
@@ -434,6 +438,10 @@ impl ThermalApp {
             lepton_part: status.part_number.clone(),
             fpa_c: status.fpa_c,
             shutter_mode: status.shutter_mode.map(|m| format!("{m:?}")),
+            calibration: f
+                .calibration
+                .is_some()
+                .then(|| self.settings.calibration.clone()),
         };
         let dir = self.settings.snapshot_dir();
         match snapshot::save(&dir, f, &self.rgba, &meta) {
@@ -602,6 +610,12 @@ impl ThermalApp {
                 Tool::Box => "끌기: 영역 그리기, 테두리는 크기 조절 · 우클릭: 삭제",
                 Tool::Line => "끌기: 선 그리기, 끝점은 조절 · 우클릭: 삭제",
             });
+            if self.frame.as_ref().is_some_and(|f| f.calibration.is_some()) {
+                ui.colored_label(
+                    calibration::ACTIVE,
+                    format!("보정 적용: {}", self.settings.calibration.summary()),
+                );
+            }
             if let (Some(f), Some(st)) = (&self.frame, &self.stats) {
                 egui::Grid::new("stats").num_columns(2).show(ui, |ui| {
                     ui.label("최고");
@@ -611,7 +625,7 @@ impl ThermalApp {
                     ui.label(format!("{:.2} {unit}", f.value(st.min)));
                     ui.end_row();
                     ui.label("평균");
-                    ui.label(format!("{:.2} {unit}", value_of_mean(f, st.mean)));
+                    ui.label(format!("{:.2} {unit}", f.value_f(st.mean)));
                     ui.end_row();
                     ui.label("중앙");
                     ui.label(format!(
@@ -671,6 +685,9 @@ impl ThermalApp {
             }
 
             ui.separator();
+            calibration::controls(ui, self, status);
+
+            ui.separator();
             alarms::controls(ui, self);
         });
     }
@@ -713,6 +730,7 @@ impl eframe::App for ThermalApp {
         let new_live = self.update_frame(&ctx);
         let status = self.camera.status();
         self.last_fpa = status.fpa_c;
+        calibration::update(self, &ctx, &status, new_live);
         alarms::update(self, &ctx, &status, new_live);
 
         egui::Panel::top("toolbar").show(ui, |ui| {
@@ -840,13 +858,6 @@ impl eframe::App for ThermalApp {
         if let Some(w) = self.seq.take() {
             let _ = w.finish();
         }
-    }
-}
-
-fn value_of_mean(f: &ThermalFrame, mean_raw: f32) -> f32 {
-    match f.kelvin_per_count {
-        Some(k) => mean_raw * k - 273.15,
-        None => mean_raw,
     }
 }
 

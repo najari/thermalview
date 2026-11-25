@@ -14,6 +14,7 @@ pub mod cid {
     pub const SYS_FFC_SHUTTER_MODE_OBJ: u16 = 0x023C;
     pub const SYS_RUN_FFC: u16 = 0x0242;
     pub const SYS_FFC_STATUS: u16 = 0x0244;
+    pub const RAD_FLUX_LINEAR_PARAMS: u16 = 0x4EBC;
     pub const RAD_TLINEAR_ENABLE: u16 = 0x4EC0;
     pub const RAD_TLINEAR_RESOLUTION: u16 = 0x4EC4;
     pub const OEM_FLIR_PART_NUMBER: u16 = 0x481C;
@@ -218,6 +219,18 @@ pub fn tlinear_scale(h: &Handle) -> Result<Option<f32>> {
     }))
 }
 
+/// Scene emissivity the Lepton itself applies to TLinear (first field of
+/// LEP_RAD_FLUX_LINEAR_PARAMS_T: 8 u16 values, emissivity scaled so 8192 = 1.0).
+pub fn scene_emissivity(h: &Handle) -> Result<f32> {
+    let mut b = [0u8; 16];
+    get(h, cid::RAD_FLUX_LINEAR_PARAMS, &mut b)?;
+    Ok(emissivity_from_params(&b))
+}
+
+fn emissivity_from_params(b: &[u8; 16]) -> f32 {
+    u16::from_le_bytes([b[0], b[1]]) as f32 / 8192.0
+}
+
 pub fn part_number(h: &Handle) -> Result<String> {
     let mut b = [0u8; 32];
     get(h, cid::OEM_FLIR_PART_NUMBER, &mut b)?;
@@ -246,6 +259,11 @@ mod tests {
         // RAD carries the OEM bit (0x4000) which the unit mapping ignores
         assert_eq!(unit_for(cid::RAD_TLINEAR_ENABLE), Some(5));
         assert_eq!(control_for(cid::RAD_TLINEAR_ENABLE), 49);
+        assert_eq!(unit_for(cid::RAD_FLUX_LINEAR_PARAMS), Some(5));
+        assert_eq!(control_for(cid::RAD_FLUX_LINEAR_PARAMS), 48);
+        let mut p = [0u8; 16];
+        p[0..2].copy_from_slice(&8192u16.to_le_bytes());
+        assert_eq!(emissivity_from_params(&p), 1.0);
         assert_eq!(unit_for(cid::OEM_FLIR_PART_NUMBER), Some(4));
         assert_eq!(unit_for(0x1234), None);
     }

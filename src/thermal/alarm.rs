@@ -65,10 +65,7 @@ impl Source {
         let v = match self {
             Source::Frame(Metric::Max) => f.value(st.max),
             Source::Frame(Metric::Min) => f.value(st.min),
-            Source::Frame(Metric::Mean) => match f.kelvin_per_count {
-                Some(k) => st.mean * k - 273.15,
-                None => st.mean,
-            },
+            Source::Frame(Metric::Mean) => f.value_f(st.mean),
             Source::Center => f.value_around(f.width / 2, f.height / 2, 1),
             Source::Spot(id) => spots.items.iter().find(|s| s.id == id)?.value(f)?,
             Source::Shape(id, m) => {
