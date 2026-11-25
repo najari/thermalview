@@ -3335,6 +3335,7 @@ dependencies = [
 name = "thermalview"
 version = "0.1.0"
 dependencies = [
+ "ab_glyph",
  "anyhow",
  "chrono",
  "eframe",
@@ -3347,6 +3348,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.21",
+ "windows",
 ]
 
 [[package]]

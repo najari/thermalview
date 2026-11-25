@@ -197,6 +197,10 @@ pub(super) fn execute(app: &mut ThermalApp, status: &CameraStatus, req: Request)
         Request::Record(false) => app
             .stop_seq()
             .map(|(p, n)| format!("frames={n} {}", p.display())),
+        Request::Video(true) => app.start_video().map(|p| p.display().to_string()),
+        Request::Video(false) => app
+            .stop_video()
+            .map(|(p, n)| format!("frames={n} {}", p.display())),
         Request::Frame => {
             let f = frame(app)?;
             let bytes: Vec<u8> = f.raw.iter().flat_map(|v| v.to_le_bytes()).collect();
@@ -233,8 +237,8 @@ fn status_line(app: &ThermalApp, status: &CameraStatus) -> String {
         .filter(|r| monitor.is_active(r.id))
         .count();
     format!(
-        "state={state} fps={:.1} frames={} fpa={fpa} unit={unit} source={} csv={} rec={} cal={} \
-         alarms={active}",
+        "state={state} fps={:.1} frames={} fpa={fpa} unit={unit} source={} csv={} rec={} mp4={} \
+         cal={} alarms={active}",
         status.fps,
         status.frames,
         if app.player.is_some() {
@@ -244,6 +248,7 @@ fn status_line(app: &ThermalApp, status: &CameraStatus) -> String {
         },
         on_off(app.csv.is_some()),
         on_off(app.seq.is_some()),
+        on_off(app.video.is_some()),
         on_off(cal),
     )
 }
@@ -476,6 +481,15 @@ mod tests {
         let seq = run(&mut app, "REC START").unwrap();
         assert!(seq.ends_with(".tvseq"), "{seq}");
         assert!(run(&mut app, "REC STOP").unwrap().starts_with("frames=0 "));
+
+        let mp4 = run(&mut app, "MP4 START").unwrap();
+        assert!(mp4.ends_with(".mp4"), "{mp4}");
+        assert!(run(&mut app, "STATUS").unwrap().contains(" mp4=on "));
+        // No frame arrived while recording: no file, and the client is told so.
+        let stop = run(&mut app, "MP4 STOP").unwrap_err();
+        assert!(stop.starts_with("no frames"), "{stop}");
+        assert!(!std::path::Path::new(&mp4).exists());
+        assert_eq!(run(&mut app, "MP4 STOP"), Err("not recording MP4".into()));
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -489,6 +503,7 @@ mod tests {
             "SNAPSHOT",
             "CSV START",
             "REC START",
+            "MP4 START",
         ] {
             assert_eq!(run(&mut app, cmd), Err("no frame yet".into()), "{cmd}");
         }

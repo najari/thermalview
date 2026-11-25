@@ -5,6 +5,7 @@ mod calibration;
 mod graphs;
 mod playback;
 mod remote;
+mod video;
 mod view;
 
 use std::path::PathBuf;
@@ -23,6 +24,7 @@ use crate::thermal::history::{History, Sample};
 use crate::thermal::palette::{self, Palette};
 use crate::thermal::range::{AutoRange, RangeMode};
 use crate::thermal::shapes::{Grab, Shape, ShapeKind};
+use crate::video::Mp4Writer;
 
 /// What a left click / drag on the image does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,6 +97,8 @@ pub struct ThermalApp {
     /// When set, the image comes from a recorded sequence instead of the camera.
     player: Option<playback::Player>,
     show_open_dialog: bool,
+    /// MP4 recording of the view (live or playback).
+    video: Option<Mp4Writer>,
 
     alarms: alarms::AlarmState,
     cal: calibration::CalState,
@@ -136,6 +140,7 @@ impl ThermalApp {
             seq: None,
             player: None,
             show_open_dialog: false,
+            video: None,
             alarms: alarms::AlarmState::default(),
             cal: calibration::CalState::default(),
             remote: remote::RemoteState::default(),
@@ -204,9 +209,18 @@ impl ThermalApp {
                 if let Some(w) = self.seq.take() {
                     let _ = w.finish();
                 }
+                // One MP4 holds one source.
+                let video = self.video.is_some().then(|| self.stop_video());
                 self.history.clear();
                 self.auto_range.reset();
-                self.notify(format!("재생: {}", p.file_name()));
+                let mut msg = format!("재생: {}", p.file_name());
+                if let Some(r) = video {
+                    msg.push_str(match r {
+                        Ok(_) => " · MP4 녹화를 끝냈습니다",
+                        Err(_) => " · MP4 저장 실패",
+                    });
+                }
+                self.notify(msg);
                 self.player = Some(p);
             }
             Err(e) => self.notify(format!("열 수 없습니다: {e}")),
@@ -214,6 +228,9 @@ impl ThermalApp {
     }
 
     fn close_player(&mut self) {
+        if self.video.is_some() {
+            let _ = self.stop_video();
+        }
         self.player = None;
         self.history.clear();
         self.auto_range.reset();
@@ -423,6 +440,7 @@ impl ThermalApp {
         self.stats = Some(f.stats());
         self.frame = Some(f);
         self.render();
+        self.push_video(t);
         self.record(t);
         is_live.then_some(t)
     }
@@ -892,6 +910,22 @@ impl eframe::App for ThermalApp {
                 {
                     self.toggle_seq(&status);
                 }
+                let mp4_label = match &self.video {
+                    Some(w) => format!("⏹ MP4 중지 ({:.0}초)", w.elapsed_secs()),
+                    None => "⏺ MP4".to_string(),
+                };
+                if ui
+                    .add_enabled(
+                        self.frame.is_some() || self.video.is_some(),
+                        egui::Button::new(mp4_label).selected(self.video.is_some()),
+                    )
+                    .on_hover_text(
+                        "보이는 영상(팔레트, 측정 표시, 색 막대)을 MP4 동영상으로 녹화. \n                         재생 중이면 재생 화면을 녹화",
+                    )
+                    .clicked()
+                {
+                    self.toggle_video();
+                }
                 if ui.button("▶ 재생…").clicked() {
                     self.show_open_dialog = true;
                 }
@@ -968,6 +1002,9 @@ impl eframe::App for ThermalApp {
             let _ = log.finish();
         }
         if let Some(w) = self.seq.take() {
+            let _ = w.finish();
+        }
+        if let Some(w) = self.video.take() {
             let _ = w.finish();
         }
     }

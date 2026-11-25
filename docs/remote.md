@@ -28,7 +28,7 @@
 | 명령 | 응답 예 | 설명 |
 | --- | --- | --- |
 | `HELP` | `OK commands: ...` | 명령 목록 |
-| `STATUS` | `OK state=streaming fps=8.9 frames=1234 fpa=31.00 unit=C source=live csv=off rec=off cal=off alarms=0` | 연결 상태(`starting`, `searching`, `busy`, `streaming`, `stalled`, `replug`), 초당 프레임, 받은 프레임 수, 센서 온도, 영상 출처(`live`/`playback`), CSV·녹화·보정 여부, 발생 중인 경보 수 |
+| `STATUS` | `OK state=streaming fps=8.9 frames=1234 fpa=31.00 unit=C source=live csv=off rec=off mp4=off cal=off alarms=0` | 연결 상태(`starting`, `searching`, `busy`, `streaming`, `stalled`, `replug`), 초당 프레임, 받은 프레임 수, 센서 온도, 영상 출처(`live`/`playback`), CSV·녹화·MP4·보정 여부, 발생 중인 경보 수 |
 | `MEAS` | `OK seq=170 time=2026-11-25T10:04:16.856+09:00 unit=C max=42.51 min=29.56 mean=33.45 center=33.59 maxpos=3,79 minpos=0,1 S1=33.59 B2.max=... B2.min=... B2.mean=...` | 현재 프레임의 최고·최저·평균·중앙(3×3 평균), 최고·최저 위치, 측정점 `S<id>`, 영역·선 `B<id>`/`L<id>`의 최고·최저·평균 |
 | `TEMP x y` | `OK 33.59` | 화소 (x, y) 주변 3×3 평균. x는 0~159, y는 0~119 |
 | `SPOT` 또는 `SPOT LIST` | `OK S1=80,60 S3=10,20` | 측정점 목록 |
@@ -43,6 +43,7 @@
 | `SNAPSHOT` | `OK C:\...\thermal_20261125_100417_368.png` | 스냅샷 저장(컬러 PNG, 16비트 PNG, JSON). 컬러 PNG 경로를 돌려줌 |
 | `CSV START` / `CSV STOP` | `OK C:\...\thermal_log_....csv` / `OK rows=86 C:\...` | 측정값 CSV 기록 |
 | `REC START` / `REC STOP` | `OK C:\...\thermal_seq_....tvseq` / `OK frames=169 C:\...` | 온도 원본 녹화. 재생 중에는 시작할 수 없음 |
+| `MP4 START` / `MP4 STOP` | `OK C:\...\thermal_video_....mp4` / `OK frames=169 C:\...` | 보이는 영상(팔레트, 측정 표시, 색 막대, 시각)을 MP4로 녹화. 재생 중이면 재생 화면을 녹화. 프레임 없이 멈추면 파일을 만들지 않고 `ERR no frames were recorded; no file written` |
 | `FRAME` | `OK w=160 h=120 seq=174 k=0.01 data=VHZm...` | 현재 프레임의 원시값. `data`는 little-endian u16을 base64로 인코딩한 값(38,400바이트 → 51,200자). 섭씨 = 값 × k − 273.15. TLinear가 꺼져 있으면 `k=none` |
 | `QUIT` | `OK bye` | 연결 종료 |
 

@@ -7,3 +7,4 @@ pub mod remote;
 pub mod settings;
 pub mod storage;
 pub mod thermal;
+pub mod video;

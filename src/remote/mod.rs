@@ -43,6 +43,8 @@ pub enum Request {
     Snapshot,
     Csv(bool),
     Record(bool),
+    /// MP4 recording of the view.
+    Video(bool),
     /// Raw counts of the current frame, base64 of little-endian u16.
     Frame,
     /// Close the connection (answered by the connection thread).
@@ -51,7 +53,7 @@ pub enum Request {
 
 pub const HELP: &str = "commands: STATUS | MEAS | TEMP x y | SPOT [LIST|ADD x y|DEL id|CLEAR] | \
 PALETTE [name] | RANGE [AUTO|lo hi] | EMISSIVITY [e] | ALARMS | SNAPSHOT | CSV START|STOP | \
-REC START|STOP | FRAME | QUIT";
+REC START|STOP | MP4 START|STOP | FRAME | QUIT";
 
 /// Parse one command line (case-insensitive, words separated by spaces).
 pub fn parse(line: &str) -> Result<Request, String> {
@@ -94,6 +96,8 @@ pub fn parse(line: &str) -> Result<Request, String> {
         ["CSV", "STOP"] => Request::Csv(false),
         ["REC", "START"] => Request::Record(true),
         ["REC", "STOP"] => Request::Record(false),
+        ["MP4", "START"] => Request::Video(true),
+        ["MP4", "STOP"] => Request::Video(false),
         ["FRAME"] => Request::Frame,
         ["QUIT" | "EXIT"] => Request::Quit,
         [] => return Err("empty command".into()),
@@ -111,6 +115,7 @@ pub fn parse(line: &str) -> Result<Request, String> {
                 "SNAPSHOT",
                 "CSV",
                 "REC",
+                "MP4",
                 "FRAME",
                 "QUIT",
             ];
@@ -218,6 +223,7 @@ mod tests {
             Ok(Request::Range(Some(RangeSet::Auto)))
         );
         assert_eq!(parse("csv stop"), Ok(Request::Csv(false)));
+        assert_eq!(parse("mp4 start"), Ok(Request::Video(true)));
         assert_eq!(
             parse("EMISSIVITY 0.95"),
             Ok(Request::Emissivity(Some(0.95)))

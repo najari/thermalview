@@ -27,6 +27,12 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 egui_plot = "0.38"
 flate2 = "1"
+ab_glyph = "0.2"
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Media_MediaFoundation",
+    "Win32_System_Com",
+] }
 
 [profile.release]
 debug = "line-tables-only"

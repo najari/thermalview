@@ -36,6 +36,7 @@
 | 바인딩 | 손으로 쓴 최소 FFI(`bindgen` 미사용) | libclang 설치 의존 제거 |
 | 설정 저장 | `serde` + JSON, `%APPDATA%\thermalview\config.json` | 이식성, 사람이 읽을 수 있음 |
 | 이미지 저장 | `image` (PNG 8비트 컬러, 16비트 그레이) | 16비트 PNG로 온도 원본을 손실 없이 저장 |
+| 동영상(MP4) | Windows 내장 Media Foundation H.264 인코더(`windows` 크레이트, `src/video/mf.rs`). 글자는 `ab_glyph`로 Windows 글꼴을 그림 | DLL 동봉·라이선스·특허 부담 없음. FFmpeg+x264는 앱 전체가 GPL이 되고, OpenH264는 소스 빌드 시 특허 비용이 면제되지 않음 |
 | 라이선스 | **미정**. 결정 전까지 GPL 코드(thermal-cat 등)는 복사하지 않는다 | 사용자 결정 사항 |
 
 방식 3(nokhwa/Media Foundation, Zadig 불필요)은 MVP 이후 별도 실험으로 검증합니다. 캡처 계층은 `trait`로 분리해 나중에 백엔드를 추가할 수 있게 합니다.
@@ -46,7 +47,7 @@
 thermalview/
 ├─ Cargo.toml                 # workspace + 앱 크레이트
 ├─ crates/
-│  ├─ libuvc-sys/             # FFI 계층 (unsafe는 여기와 src/camera/에만)
+│  ├─ libuvc-sys/             # FFI 계층 (unsafe는 여기, src/camera/uvc.rs, src/video/mf.rs에만)
 │  │  ├─ build.rs             # libuvc C 소스 + shim 컴파일, libusb1-sys에 링크
 │  │  ├─ compat/              # pthread.h, sys/time.h shim (MSVC 전용)
 │  │  ├─ vendor/libuvc/       # GetThermal 세션에서 패치한 libuvc (BSD, LICENSE.txt 유지)
@@ -68,6 +69,10 @@ thermalview/
 │  ├─ remote/
 │  │  ├─ mod.rs               # 원격 명령 해석(순수 함수), 응답 형식, base64
 │  │  └─ server.rs            # TCP 수신 스레드와 연결별 스레드
+│  ├─ video/
+│  │  ├─ mod.rs               # MP4 쓰기 스레드(Mp4Writer)
+│  │  ├─ overlay.rs           # 녹화 화면 그리기(확대, 표식, 색 막대, 글자), NV12 변환. 순수 함수
+│  │  └─ mf.rs                # Media Foundation H.264 인코더 (unsafe)
 │  ├─ storage/snapshot.rs
 │  ├─ settings.rs
 │  └─ app/                    # egui 화면: 영상 뷰, 제어 패널, 상태 줄
@@ -100,6 +105,7 @@ thermalview/
   - 프레임이 없어도 상태 갱신을 위해 0.5초마다 다시 실행합니다.
 - **원격 제어 스레드(`remote/server.rs`):** 수신 스레드 1개와 연결마다 스레드 1개. 명령 줄을 해석해 채널로 UI 스레드에 넘기고 `request_repaint()`로 깨운 뒤 응답을 기다립니다(최대 3초). 앱 상태는 UI 스레드만 만지므로 잠금이 없습니다.
 - **저장:** 스냅샷 파일 3개는 합쳐 50 KB 정도라 UI 스레드에서 바로 씁니다. 시퀀스 녹화(단계 3)는 별도 스레드로 합니다.
+- **MP4 쓰기 스레드(`video/mod.rs`):** UI 스레드는 프레임마다 컬러 영상과 표식 목록(`Scene`)만 보내고, 그리기·NV12 변환·인코딩은 이 스레드가 합니다. COM과 Media Foundation 객체는 이 스레드에서 만들고 이 스레드에서만 씁니다.
 
 ## 6. 단계별 작업
 
@@ -200,11 +206,31 @@ v2 압축과 드래그 편집은 위 자동 시험으로 확인했고, 앱 화�
 - 수신은 8.9 fps를 유지했습니다.
 - 화면의 원격 제어 항목은 헤드리스 UI 시험으로만 그려 봤고, 실제 창에서는 직접 보지 않았습니다.
 
+### 단계 7 — MP4 녹화
+
+| 항목 | 기준 |
+| --- | --- |
+| 내용 | 화면의 영상 뷰와 같은 그림: 컬러 영상을 4배 최근접 확대(160×120 → 640×480), 최고·최저 표식(표시가 켜져 있을 때), Spot, Box/Line과 그 값, 오른쪽 색 막대와 눈금 5개, 왼쪽 위에 시각(재생 중이면 재생 위치)과 적용 중인 보정. 마우스 위치 값과 그리는 중인 도형은 넣지 않음 |
+| 형식 | 736×480(H.264가 다루기 쉬운 16의 배수), H.264 High, 평균 2 Mbps, BT.601 제한 범위 NV12 입력. 컨테이너 MP4 |
+| 시각 | 프레임마다 실제 도착 시각(재생 중이면 녹화 시각)을 씀(가변 프레임 간격). 시각이 뒤로 가면(재생 중 되감기) 이전 프레임 + 1/9초 |
+| 대상 | 새로 표시되는 프레임마다 1장. 실시간과 재생 모두 녹화 가능(`.tvseq` → MP4 내보내기). 영상 출처가 바뀌면(재생 열기·닫기) 녹화를 끝냄. 일시정지 중에는 기록하지 않음 |
+| 끝내기 | 중지, 앱 종료 시 파일을 마무리(`Finalize`). 앱이 강제 종료되면 파일을 재생할 수 없음 |
+| 오류 | 시작 실패(Media Foundation 없음 등)는 바로 알림. 녹화 중 인코더 오류는 녹화를 멈추고 알림 |
+| 원격 | `MP4 START`/`MP4 STOP`, `STATUS`의 `mp4=` |
+| 빈 녹화 | 프레임 없이 멈추면 Media Foundation이 마무리를 거부하므로(0xC00D4A44) 파일을 지우고 "기록된 프레임 없음"으로 알림 |
+
+2026-11-25 실제 카메라 확인(임시 설정, 창 최소화, 원격 명령으로 조작):
+- 20초 녹화에서 MP4 169프레임과 같은 시간의 CSV 169행이 일치했습니다. 파일은 1.68 MB(약 0.3 GB/시간)였습니다.
+- 녹화 파일을 Windows 디코더로 다시 풀어 확인했습니다(저장소 밖의 임시 검사 도구). H.264 High, 736×480, 169프레임 모두 디코딩됐고 시각은 계속 증가했습니다. 풀어낸 프레임에서 시각, Spot, Box, Line, 최고·최저 표식, 색 막대가 화면과 같은 자리에 그려진 것을 확인했습니다.
+- 프레임 간격이 600 ms 안팎으로 벌어진 곳이 2번 있었는데, CSV에도 같은 자리에 같은 공백이 있었습니다. MP4 없이 기록한 오전 CSV에도 최대 750 ms 공백이 있었고, 평균 속도도 MP4 없이 8.35 fps, MP4와 함께 8.34 fps로 같습니다. 따라서 MP4 녹화 때문이 아니라 카메라 쪽 수신 공백입니다.
+- 녹화 중에 앱을 닫으면 파일이 마무리되어 정상으로 재생됩니다(40프레임).
+- 재생 화면 녹화(`.tvseq` → MP4)는 자동 시험으로만 확인했습니다. 도구 막대의 MP4 버튼은 아직 화면에서 직접 보지 않았습니다.
+
 남은 일: USB 물리 분리 시험, 렌즈를 가린 FFC 시험, 라이선스·배포 결정(10절).
 
 ## 7. 코드 규칙
 
-- `unsafe`는 `crates/libuvc-sys`와 `src/camera/uvc.rs`에만 둡니다. 각 `unsafe` 블록 위에 안전 조건을 주석으로 적습니다. 외부 코드를 그대로 가져온 `crates/winit`은 이 규칙의 대상이 아닙니다.
+- `unsafe`는 `crates/libuvc-sys`, `src/camera/uvc.rs`, `src/video/mf.rs`(Media Foundation COM 호출)에만 둡니다. 각 `unsafe` 블록 위에 안전 조건을 주석으로 적습니다. 외부 코드를 그대로 가져온 `crates/winit`은 이 규칙의 대상이 아닙니다.
 - 캡처·제어 경로에서 `unwrap`/`expect` 금지. 오류는 `anyhow::Result` 또는 전용 오류 타입으로 UI까지 올려 상태 줄에 표시합니다.
 - `thermal/` 모듈은 장치 없이 테스트할 수 있어야 합니다(순수 함수). 팔레트, 범위, 통계, Spot 계산에 단위 테스트를 둡니다.
 - 커밋 전: `cargo fmt`, `cargo clippy --all-targets`(경고 0 목표), `cargo test`.
@@ -235,6 +261,6 @@ cargo run --release --example grab
 
 ## 10. 열린 결정
 
-- 라이선스(MIT/Apache-2.0 이중 라이선스 권장, GPL 코드를 가져올 경우 GPL-3.0). 주의: 현재 정적 링크하는 libusb는 LGPL-2.1이므로, 실행 파일을 배포하려면 libusb를 DLL로 분리하거나 LGPL의 재링크 조건을 충족해야 합니다
+- 라이선스(MIT/Apache-2.0 이중 라이선스 권장, GPL 코드를 가져올 경우 GPL-3.0). 주의: 현재 정적 링크하는 libusb는 LGPL-2.1이므로, 실행 파일을 배포하려면 libusb를 DLL로 분리하거나 LGPL의 재링크 조건을 충족해야 합니다. MP4는 Windows 내장 인코더를 쓰므로 라이선스 선택에 영향이 없습니다
 - 외부 배포 여부(배포한다면 방식 3 우선순위 상승)
 - 2차 범위 우선순위
