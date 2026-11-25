@@ -92,13 +92,13 @@ pub(super) fn attach(app: &mut ThermalApp, f: &mut ThermalFrame) {
 }
 
 /// Re-apply the correction to the frame on screen after a settings change.
-fn reapply(app: &mut ThermalApp, ctx: &egui::Context) {
+pub(super) fn reapply(app: &mut ThermalApp) {
     if let Some(mut f) = app.frame.take() {
         attach(app, &mut f);
         app.frame = Some(f);
     }
     app.auto_range.reset();
-    app.render(ctx);
+    app.render();
 }
 
 /// Uncorrected camera reading at `src` (3×3 mean), °C.
@@ -126,13 +126,8 @@ pub(super) fn start_capture(app: &mut ThermalApp) {
     });
 }
 
-/// Run once per UI pass: feeds a reference capture with new live frames.
-pub(super) fn update(
-    app: &mut ThermalApp,
-    ctx: &egui::Context,
-    status: &CameraStatus,
-    new_live: Option<f64>,
-) {
+/// Run once per pass: feeds a reference capture with new live frames.
+pub(super) fn update(app: &mut ThermalApp, status: &CameraStatus, new_live: Option<f64>) {
     let Some(cap) = &mut app.cal.capture else {
         return;
     };
@@ -170,7 +165,7 @@ pub(super) fn update(
                 "기준점 기록: 측정 {measured:.2} °C → 기준 {reference:.2} °C"
             ));
             app.mark_dirty();
-            reapply(app, ctx);
+            reapply(app);
         }
         Err(e) => app.notify(format!("기준점을 기록하지 못했습니다: {e}")),
     }
@@ -322,8 +317,7 @@ pub(super) fn controls(ui: &mut egui::Ui, app: &mut ThermalApp, status: &CameraS
     }
     if app.settings.calibration != before {
         app.mark_dirty();
-        let ctx = ui.ctx().clone();
-        reapply(app, &ctx);
+        reapply(app);
     }
 }
 
@@ -351,13 +345,13 @@ mod tests {
 
     #[test]
     fn capture_averages_live_frames_then_corrects_display() {
-        let (mut app, ctx) = rig();
+        let (mut app, _) = rig();
         app.cal.reference_c = 27.35;
         start_capture(&mut app);
         for i in 0..CAPTURE_FRAMES {
             // Repeated passes without a new frame must not count.
-            update(&mut app, &ctx, &streaming(), None);
-            update(&mut app, &ctx, &streaming(), Some(i as f64));
+            update(&mut app, &streaming(), None);
+            update(&mut app, &streaming(), Some(i as f64));
         }
         assert_eq!(app.cal.capturing(), None);
         let refs = &app.settings.calibration.refs;
@@ -371,18 +365,18 @@ mod tests {
 
     #[test]
     fn capture_stops_without_live_video_or_its_spot() {
-        let (mut app, ctx) = rig();
+        let (mut app, _) = rig();
         start_capture(&mut app);
-        update(&mut app, &ctx, &CameraStatus::default(), None);
+        update(&mut app, &CameraStatus::default(), None);
         assert_eq!(app.cal.capturing(), None);
 
         let id = app.settings.spots.add(10, 10).unwrap();
         app.cal.source = RefSource::Spot(id);
         start_capture(&mut app);
-        update(&mut app, &ctx, &streaming(), Some(0.0));
+        update(&mut app, &streaming(), Some(0.0));
         assert_eq!(app.cal.capturing(), Some(1));
         app.settings.spots.remove(id);
-        update(&mut app, &ctx, &streaming(), Some(0.1));
+        update(&mut app, &streaming(), Some(0.1));
         assert_eq!(app.cal.capturing(), None);
         assert!(app.settings.calibration.refs.is_empty());
     }

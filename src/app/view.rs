@@ -406,7 +406,8 @@ mod tests {
             let f = ThermalFrame::new(160, 120, vec![30000; 160 * 120], Some(0.01));
             app.stats = Some(f.stats());
             app.frame = Some(f);
-            app.render(&ctx);
+            app.render();
+            app.upload_texture(&ctx);
             let mut rig = Self {
                 ctx,
                 app,

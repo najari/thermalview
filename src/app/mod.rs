@@ -4,9 +4,11 @@ mod alarms;
 mod calibration;
 mod graphs;
 mod playback;
+mod remote;
 mod view;
 
-use std::time::{Duration, Instant};
+use std::path::PathBuf;
+use std::time::{Duration, Instant, SystemTime};
 
 use eframe::egui;
 
@@ -69,6 +71,8 @@ pub struct ThermalApp {
     stats: Option<FrameStats>,
     rgba: Vec<u8>,
     texture: Option<egui::TextureHandle>,
+    /// `rgba` changed since the texture was last uploaded.
+    texture_dirty: bool,
     lut: (Palette, [[u8; 3]; 256]),
     auto_range: AutoRange,
     /// Range used for the current image, in display units.
@@ -94,6 +98,7 @@ pub struct ThermalApp {
 
     alarms: alarms::AlarmState,
     cal: calibration::CalState,
+    remote: remote::RemoteState,
 }
 
 impl ThermalApp {
@@ -115,6 +120,7 @@ impl ThermalApp {
             stats: None,
             rgba: Vec::new(),
             texture: None,
+            texture_dirty: false,
             lut,
             auto_range: AutoRange::default(),
             display_range: (20.0, 40.0),
@@ -132,19 +138,29 @@ impl ThermalApp {
             show_open_dialog: false,
             alarms: alarms::AlarmState::default(),
             cal: calibration::CalState::default(),
+            remote: remote::RemoteState::default(),
         }
     }
 
     fn toggle_seq(&mut self, status: &CameraStatus) {
-        if let Some(w) = self.seq.take() {
-            match w.finish() {
-                Ok((path, n)) => self.notify(format!("녹화 종료: {n}프레임 → {}", path.display())),
-                Err(e) => self.notify(format!("녹화 파일 저장 실패: {e}")),
-            }
-            return;
+        let _ = if self.seq.is_some() {
+            self.stop_seq().map(drop)
+        } else {
+            self.start_seq(status).map(drop)
+        };
+    }
+
+    /// Start recording the live video. The user is notified of the outcome; the error text is
+    /// for remote clients.
+    fn start_seq(&mut self, status: &CameraStatus) -> Result<PathBuf, String> {
+        if self.seq.is_some() {
+            return Err("already recording".into());
+        }
+        if self.player.is_some() {
+            return Err("a recording is being played back; recording needs live video".into());
         }
         let Some(f) = &self.frame else {
-            return;
+            return Err("no frame yet".into());
         };
         let header = SeqHeader {
             width: f.width,
@@ -155,10 +171,30 @@ impl ThermalApp {
         };
         match SeqWriter::start(&self.settings.snapshot_dir(), header) {
             Ok(w) => {
-                self.notify(format!("녹화 시작: {}", w.path().display()));
+                let path = w.path().to_path_buf();
+                self.notify(format!("녹화 시작: {}", path.display()));
                 self.seq = Some(w);
+                Ok(path)
             }
-            Err(e) => self.notify(format!("녹화 파일을 만들 수 없습니다: {e}")),
+            Err(e) => {
+                self.notify(format!("녹화 파일을 만들 수 없습니다: {e}"));
+                Err(format!("cannot create the recording: {e}"))
+            }
+        }
+    }
+
+    /// Finish the recording; returns its path and frame count.
+    fn stop_seq(&mut self) -> Result<(PathBuf, u64), String> {
+        let w = self.seq.take().ok_or("not recording")?;
+        match w.finish() {
+            Ok((path, n)) => {
+                self.notify(format!("녹화 종료: {n}프레임 → {}", path.display()));
+                Ok((path, n))
+            }
+            Err(e) => {
+                self.notify(format!("녹화 파일 저장 실패: {e}"));
+                Err(format!("saving the recording failed: {e}"))
+            }
         }
     }
 
@@ -279,14 +315,35 @@ impl ThermalApp {
     }
 
     fn toggle_csv(&mut self) {
-        if let Some(log) = self.csv.take() {
-            match log.finish() {
-                Ok((path, rows)) => {
-                    self.notify(format!("기록 종료: {rows}행 → {}", path.display()))
-                }
-                Err(e) => self.notify(format!("CSV 저장 실패: {e}")),
+        let _ = if self.csv.is_some() {
+            self.stop_csv().map(drop)
+        } else {
+            self.start_csv().map(drop)
+        };
+    }
+
+    /// Finish the CSV log; returns its path and row count.
+    fn stop_csv(&mut self) -> Result<(PathBuf, u64), String> {
+        let log = self.csv.take().ok_or("not logging")?;
+        match log.finish() {
+            Ok((path, rows)) => {
+                self.notify(format!("기록 종료: {rows}행 → {}", path.display()));
+                Ok((path, rows))
             }
-            return;
+            Err(e) => {
+                self.notify(format!("CSV 저장 실패: {e}"));
+                Err(format!("saving the CSV failed: {e}"))
+            }
+        }
+    }
+
+    /// Start logging every frame to CSV. The user is notified of the outcome.
+    fn start_csv(&mut self) -> Result<PathBuf, String> {
+        if self.csv.is_some() {
+            return Err("already logging".into());
+        }
+        if self.frame.is_none() {
+            return Err("no frame yet".into());
         }
         let unit = match self.frame.as_ref().map(|f| f.is_radiometric()) {
             Some(false) => "cnt",
@@ -302,10 +359,15 @@ impl ThermalApp {
             .collect();
         match CsvLog::start(&self.settings.snapshot_dir(), &ids, &shapes, unit) {
             Ok(log) => {
-                self.notify(format!("기록 시작: {}", log.path().display()));
+                let path = log.path().to_path_buf();
+                self.notify(format!("기록 시작: {}", path.display()));
                 self.csv = Some(log);
+                Ok(path)
             }
-            Err(e) => self.notify(format!("CSV 파일을 만들 수 없습니다: {e}")),
+            Err(e) => {
+                self.notify(format!("CSV 파일을 만들 수 없습니다: {e}"));
+                Err(format!("cannot create the CSV: {e}"))
+            }
         }
     }
 
@@ -328,13 +390,13 @@ impl ThermalApp {
         }
     }
 
-    /// Pull the newest frame (from the camera, or the player during playback) and re-render.
-    /// Returns the frame time if a new *live* frame arrived.
-    fn update_frame(&mut self, ctx: &egui::Context) -> Option<f64> {
-        let live = self.camera.take_frame();
+    /// Pull the next frame (the oldest queued camera frame, or the player's during playback) and
+    /// re-render. Returns the frame time if a new *live* frame arrived.
+    fn update_frame(&mut self) -> Option<f64> {
         let is_live = self.player.is_none();
         let (mut f, t) = if let Some(p) = &mut self.player {
             // Live frames are dropped during playback; the camera stays connected.
+            while self.camera.take_frame().is_some() {}
             match p.tick() {
                 Ok(Some((t_ms, f))) => (f, t_ms as f64 / 1000.0),
                 Ok(None) => return None,
@@ -346,22 +408,29 @@ impl ThermalApp {
                 }
             }
         } else {
-            let f = live?;
+            let f = self.camera.take_frame()?;
             if let Some(w) = &mut self.seq {
                 w.push(&f);
             }
-            (f, self.started.elapsed().as_secs_f64())
+            // Time of arrival, not of processing: queued frames are handled in a burst.
+            let age = SystemTime::now()
+                .duration_since(f.captured)
+                .unwrap_or_default();
+            let t = self.started.elapsed().saturating_sub(age);
+            (f, t.as_secs_f64())
         };
         calibration::attach(self, &mut f);
         self.stats = Some(f.stats());
         self.frame = Some(f);
-        self.render(ctx);
+        self.render();
         self.record(t);
         is_live.then_some(t)
     }
 
-    /// Recolor the current frame (after a new frame or a palette/range change).
-    fn render(&mut self, ctx: &egui::Context) {
+    /// Recolor the current frame (after a new frame or a palette/range change). The texture is
+    /// uploaded later by [`Self::upload_texture`], only when the window is drawn: texture
+    /// updates made while it is hidden would pile up undelivered.
+    fn render(&mut self) {
         let (Some(f), Some(st)) = (&self.frame, &self.stats) else {
             return;
         };
@@ -375,6 +444,17 @@ impl ThermalApp {
         let lo = f.raw_from_value(self.display_range.0);
         let hi = f.raw_from_value(self.display_range.1);
         palette::colorize(&f.raw, lo, hi, &self.lut.1, &mut self.rgba);
+        self.texture_dirty = true;
+    }
+
+    fn upload_texture(&mut self, ctx: &egui::Context) {
+        let Some(f) = &self.frame else {
+            return;
+        };
+        if !self.texture_dirty || self.rgba.len() != f.width * f.height * 4 {
+            return;
+        }
+        self.texture_dirty = false;
         let image = egui::ColorImage::from_rgba_unmultiplied([f.width, f.height], &self.rgba);
         match &mut self.texture {
             Some(t) => t.set(image, egui::TextureOptions::NEAREST),
@@ -385,10 +465,11 @@ impl ThermalApp {
         }
     }
 
-    fn take_snapshot(&mut self, status: &CameraStatus) {
+    /// Save a snapshot of the current frame; returns the color PNG path.
+    fn take_snapshot(&mut self, status: &CameraStatus) -> Result<PathBuf, String> {
         let (Some(f), Some(st)) = (&self.frame, &self.stats) else {
             self.notify("저장할 영상이 없습니다");
-            return;
+            return Err("no frame yet".into());
         };
         let meta = SnapshotMeta {
             app: "thermalview",
@@ -445,8 +526,14 @@ impl ThermalApp {
         };
         let dir = self.settings.snapshot_dir();
         match snapshot::save(&dir, f, &self.rgba, &meta) {
-            Ok(files) => self.notify(format!("저장됨: {}", files.color_png.display())),
-            Err(e) => self.notify(format!("스냅샷 저장 실패: {e}")),
+            Ok(files) => {
+                self.notify(format!("저장됨: {}", files.color_png.display()));
+                Ok(files.color_png)
+            }
+            Err(e) => {
+                self.notify(format!("스냅샷 저장 실패: {e}"));
+                Err(format!("snapshot failed: {e}"))
+            }
         }
     }
 
@@ -594,8 +681,7 @@ impl ThermalApp {
                 .changed();
             if changed {
                 self.mark_dirty();
-                let ctx = ui.ctx().clone();
-                self.render(&ctx);
+                self.render();
             }
 
             ui.separator();
@@ -689,6 +775,9 @@ impl ThermalApp {
 
             ui.separator();
             alarms::controls(ui, self);
+
+            ui.separator();
+            remote::controls(ui, self);
         });
     }
 
@@ -724,14 +813,37 @@ impl ThermalApp {
     }
 }
 
-impl eframe::App for ThermalApp {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        let ctx = ui.ctx().clone();
-        let new_live = self.update_frame(&ctx);
+impl ThermalApp {
+    /// Frame processing, recording, alarms and remote commands. Runs on every pass, and also
+    /// while the window is minimized or not being drawn, when eframe skips `ui`.
+    fn tick(&mut self, ctx: &egui::Context) {
         let status = self.camera.status();
         self.last_fpa = status.fpa_c;
-        calibration::update(self, &ctx, &status, new_live);
-        alarms::update(self, &ctx, &status, new_live);
+        // Every queued frame, oldest first, so recordings and alarms see them all.
+        loop {
+            let new_live = self.update_frame();
+            calibration::update(self, &status, new_live);
+            alarms::update(self, ctx, &status, new_live);
+            if new_live.is_none() {
+                break;
+            }
+        }
+        remote::sync(self, ctx);
+        remote::process(self, &status);
+        self.save_settings_if_due(false);
+        // Keep status fresh even when no frames arrive (disconnected / stalled).
+        ctx.request_repaint_after(Duration::from_millis(500));
+    }
+}
+
+impl eframe::App for ThermalApp {
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.tick(ctx);
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        let status = self.camera.status();
 
         egui::Panel::top("toolbar").show(ui, |ui| {
             ui.horizontal(|ui| {
@@ -741,7 +853,7 @@ impl eframe::App for ThermalApp {
                     .add_enabled(self.frame.is_some(), egui::Button::new("📷 스냅샷"))
                     .clicked()
                 {
-                    self.take_snapshot(&status);
+                    let _ = self.take_snapshot(&status);
                 }
                 let rec_label = match &self.csv {
                     Some(log) => format!("⏹ 기록 중지 ({}행)", log.rows()),
@@ -837,6 +949,8 @@ impl eframe::App for ThermalApp {
                 .show(ui, |ui| graphs::show(ui, self));
         }
 
+        // After the panels: their controls may have recolored the image.
+        self.upload_texture(&ctx);
         egui::CentralPanel::default().show(ui, |ui| {
             if view::image_view(ui, self) {
                 self.mark_dirty();
@@ -845,12 +959,10 @@ impl eframe::App for ThermalApp {
 
         self.ffc_dialog(&ctx);
         self.open_dialog(&ctx);
-        self.save_settings_if_due(false);
-        // Keep status fresh even when no frames arrive (disconnected / stalled).
-        ctx.request_repaint_after(Duration::from_millis(500));
     }
 
     fn on_exit(&mut self) {
+        self.remote.stop();
         self.save_settings_if_due(true);
         if let Some(log) = self.csv.take() {
             let _ = log.finish();
@@ -895,5 +1007,40 @@ fn install_korean_font(ctx: &egui::Context) {
             ],
         )),
         Err(e) => log::warn!("Korean font not loaded ({}): {e}", path.display()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A hidden window gets few passes: one pass must process every frame that queued up.
+    #[test]
+    fn one_pass_takes_every_queued_frame() {
+        let dir = std::env::temp_dir().join(format!("thermalview_queue_{}", std::process::id()));
+        let settings = Settings {
+            snapshot_dir: Some(dir.clone()),
+            ..Default::default()
+        };
+        let mut app = ThermalApp::with_camera(settings, Camera::disconnected());
+        let ctx = egui::Context::default();
+        let frame = |seq| {
+            let mut f = ThermalFrame::new(160, 120, vec![30000; 160 * 120], Some(0.01));
+            f.sequence = seq;
+            f
+        };
+        app.camera.inject(frame(1));
+        app.tick(&ctx);
+        app.start_csv().unwrap();
+        app.start_seq(&CameraStatus::default()).unwrap();
+        for seq in 2..=6 {
+            app.camera.inject(frame(seq));
+        }
+        app.tick(&ctx);
+        assert_eq!(app.frame.as_ref().map(|f| f.sequence), Some(6));
+        assert!(app.texture_dirty);
+        assert_eq!(app.stop_csv().unwrap().1, 5);
+        assert_eq!(app.stop_seq().unwrap().1, 5);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

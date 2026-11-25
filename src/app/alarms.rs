@@ -31,6 +31,10 @@ pub(super) struct AlarmState {
 }
 
 impl AlarmState {
+    pub(super) fn monitor(&self) -> &Monitor {
+        &self.monitor
+    }
+
     fn push(&mut self, text: String, color: Option<Color32>) {
         if self.log.len() == LOG_MAX {
             self.log.pop_front();

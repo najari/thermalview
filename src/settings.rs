@@ -27,6 +27,26 @@ pub struct Settings {
     pub calibration: Calibration,
     pub show_extremes: bool,
     pub snapshot_dir: Option<PathBuf>,
+    pub remote: RemoteSettings,
+}
+
+/// TCP remote control. Off by default; loopback only unless `allow_lan`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RemoteSettings {
+    pub enabled: bool,
+    pub port: u16,
+    pub allow_lan: bool,
+}
+
+impl Default for RemoteSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            port: crate::remote::DEFAULT_PORT,
+            allow_lan: false,
+        }
+    }
 }
 
 impl Default for Settings {
@@ -41,6 +61,7 @@ impl Default for Settings {
             calibration: Calibration::default(),
             show_extremes: true,
             snapshot_dir: None,
+            remote: RemoteSettings::default(),
         }
     }
 }
@@ -96,6 +117,8 @@ mod tests {
         assert_eq!(s.palette, Palette::Rainbow);
         assert_eq!(s.shutter_mode, ShutterMode::Manual);
         assert!(s.show_extremes);
+        assert!(!s.remote.enabled, "remote control must be opt-in");
+        assert!(!s.remote.allow_lan);
     }
 
     #[test]

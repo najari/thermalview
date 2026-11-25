@@ -3,6 +3,7 @@
 
 pub mod app;
 pub mod camera;
+pub mod remote;
 pub mod settings;
 pub mod storage;
 pub mod thermal;

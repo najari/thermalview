@@ -2,8 +2,9 @@
 //!
 //! Every USB call (stream control and Lepton commands) happens on this one thread, which keeps
 //! them serialized without a shared lock (DEVELOPMENT.md §4.8). The UI talks to it through a
-//! command channel and reads a shared status snapshot plus a "latest frame" slot.
+//! command channel and reads a shared status snapshot plus a short queue of received frames.
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -79,8 +80,13 @@ pub enum Command {
     SetShutterMode(ShutterMode),
 }
 
+/// Frames kept for the UI thread (about 1.8 s). eframe runs a hidden window only about ten
+/// times a second, close to the frame rate, so a single slot would lose frames while minimized.
+const QUEUE_MAX: usize = 16;
+
 struct Shared {
-    latest: Mutex<Option<ThermalFrame>>,
+    /// Received frames not yet taken, oldest first.
+    queue: Mutex<VecDeque<ThermalFrame>>,
     status: Mutex<CameraStatus>,
     frames: AtomicU64,
     /// Milliseconds since `epoch` of the last good frame.
@@ -114,7 +120,7 @@ impl Camera {
     /// `repaint` is called whenever a new frame or status is available.
     pub fn start(desired_mode: ShutterMode, repaint: impl Fn() + Send + Sync + 'static) -> Self {
         let shared = Arc::new(Shared {
-            latest: Mutex::new(None),
+            queue: Mutex::new(VecDeque::new()),
             status: Mutex::new(CameraStatus::default()),
             frames: AtomicU64::new(0),
             last_frame_ms: AtomicU64::new(0),
@@ -135,7 +141,7 @@ impl Camera {
     #[cfg(test)]
     pub(crate) fn disconnected() -> Self {
         let shared = Arc::new(Shared {
-            latest: Mutex::new(None),
+            queue: Mutex::new(VecDeque::new()),
             status: Mutex::new(CameraStatus::default()),
             frames: AtomicU64::new(0),
             last_frame_ms: AtomicU64::new(0),
@@ -151,9 +157,21 @@ impl Camera {
         }
     }
 
-    /// Take the newest frame if one arrived since the last call.
+    /// Queue a frame as if the camera had sent it (tests of the disconnected camera).
+    #[cfg(test)]
+    pub(crate) fn inject(&self, f: ThermalFrame) {
+        if let Ok(mut q) = self.shared.queue.lock() {
+            q.push_back(f);
+        }
+    }
+
+    /// Take the oldest frame not yet taken. Call until None to see every frame.
     pub fn take_frame(&self) -> Option<ThermalFrame> {
-        self.shared.latest.lock().ok().and_then(|mut l| l.take())
+        self.shared
+            .queue
+            .lock()
+            .ok()
+            .and_then(|mut q| q.pop_front())
     }
 
     pub fn status(&self) -> CameraStatus {
@@ -276,8 +294,11 @@ fn start_stream(h: &mut Handle, shared: &Arc<Shared>, scale: Option<f32>) -> Res
             captured: SystemTime::now(),
             calibration: None,
         };
-        if let Ok(mut l) = s.latest.lock() {
-            *l = Some(frame);
+        if let Ok(mut q) = s.queue.lock() {
+            if q.len() == QUEUE_MAX {
+                q.pop_front();
+            }
+            q.push_back(frame);
         }
         s.frames.fetch_add(1, Ordering::Relaxed);
         s.last_frame_ms.store(s.now_ms(), Ordering::Relaxed);
