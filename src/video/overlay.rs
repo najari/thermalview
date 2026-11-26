@@ -1,7 +1,12 @@
 //! The picture recorded to MP4: the colored image enlarged, with the screen's markers and labels,
 //! a color bar and a caption burned in. Pure code (no Windows calls), unit-tested.
 
+use std::sync::Arc;
+
 use ab_glyph::{point, Font as _, FontVec, PxScale, ScaleFont as _};
+
+use crate::webcam::blend::{self, Overlay};
+use crate::webcam::Picture;
 
 /// Each thermal pixel becomes a SCALE×SCALE block (nearest neighbour, as on screen).
 pub const SCALE: usize = 4;
@@ -56,6 +61,20 @@ pub struct Scene {
     /// Top-left text (time, calibration).
     pub caption: String,
     pub marks: Vec<Mark>,
+    /// Webcam picture mixed in as on screen.
+    pub webcam: Option<WebcamLayer>,
+    /// The upscaled image (SCALE·width × SCALE·height RGBA) when the view shows one; drawn
+    /// instead of enlarging `rgba`.
+    pub upscaled: Option<Vec<u8>>,
+}
+
+// The upscaled view image fills the video's image area exactly.
+const _: () = assert!(SCALE == crate::thermal::upscale::FACTOR);
+
+#[derive(Debug, Clone)]
+pub struct WebcamLayer {
+    pub picture: Arc<Picture>,
+    pub overlay: Overlay,
 }
 
 /// Video frame size for a thermal image. H.264 works in 16×16 blocks.
@@ -298,7 +317,14 @@ pub fn compose(scene: &Scene, text: &Text) -> Canvas {
     let (cw, ch) = canvas_size(scene.width, scene.height);
     let mut cv = Canvas::new(cw, ch);
     let (iw, ih) = (scene.width * SCALE, scene.height * SCALE);
-    if scene.rgba.len() == scene.width * scene.height * 4 {
+    if let Some(up) = scene.upscaled.as_ref().filter(|u| u.len() == iw * ih * 4) {
+        for y in 0..ih {
+            for x in 0..iw {
+                let (s, d) = ((y * iw + x) * 4, (y * cw + x) * 3);
+                cv.rgb[d..d + 3].copy_from_slice(&up[s..s + 3]);
+            }
+        }
+    } else if scene.rgba.len() == scene.width * scene.height * 4 {
         for y in 0..ih {
             let row = (y / SCALE) * scene.width;
             for x in 0..iw {
@@ -307,6 +333,9 @@ pub fn compose(scene: &Scene, text: &Text) -> Canvas {
                 cv.rgb[d..d + 3].copy_from_slice(&scene.rgba[s..s + 3]);
             }
         }
+    }
+    if let Some(layer) = &scene.webcam {
+        mix_webcam(&mut cv, scene, layer);
     }
     let bounds = (0, 0, iw as i32, ih as i32);
     let center = |(x, y): (usize, usize)| {
@@ -384,6 +413,25 @@ pub fn compose(scene: &Scene, text: &Text) -> Canvas {
     cv
 }
 
+/// Mix the webcam picture into the enlarged thermal image, as the screen does.
+fn mix_webcam(cv: &mut Canvas, scene: &Scene, layer: &WebcamLayer) {
+    let pic = &layer.picture;
+    let place = layer
+        .overlay
+        .align
+        .placement((scene.width, scene.height), (pic.width, pic.height));
+    for y in 0..scene.height * SCALE {
+        let ty = (y as f32 + 0.5) / SCALE as f32;
+        for x in 0..scene.width * SCALE {
+            let tx = (x as f32 + 0.5) / SCALE as f32;
+            let thermal = cv.get(x, y);
+            let cam = blend::sample(pic, place, tx, ty);
+            let i = (y * cv.width + x) * 3;
+            cv.rgb[i..i + 3].copy_from_slice(&blend::mix(&layer.overlay, thermal, cam));
+        }
+    }
+}
+
 /// RGB → NV12 (BT.601, limited range): a full-size Y plane, then interleaved U/V at half size.
 /// Width and height must be even.
 pub fn to_nv12(cv: &Canvas, out: &mut Vec<u8>) {
@@ -430,6 +478,8 @@ mod tests {
             unit: "°C",
             caption: "2026-11-25 10:00:00".into(),
             marks: vec![],
+            webcam: None,
+            upscaled: None,
         }
     }
 

@@ -5,7 +5,7 @@
 use std::time::{Duration, Instant};
 
 use thermalview::camera::lepton::ShutterMode;
-use thermalview::camera::Camera;
+use thermalview::camera::{Camera, Config, Source};
 use thermalview::storage::sequence::{encode_frame, SeqHeader, SeqReader, SeqWriter};
 
 fn main() -> anyhow::Result<()> {
@@ -13,7 +13,14 @@ fn main() -> anyhow::Result<()> {
         .nth(1)
         .and_then(|s| s.parse().ok())
         .unwrap_or(20);
-    let cam = Camera::start(ShutterMode::Manual, || {});
+    let cam = Camera::start(
+        Config {
+            source: Source::PureThermal,
+            shutter_mode: ShutterMode::Manual,
+            gain: Default::default(),
+        },
+        || {},
+    );
 
     let wait = Instant::now();
     let first = loop {

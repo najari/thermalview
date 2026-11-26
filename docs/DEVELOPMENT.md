@@ -5,7 +5,7 @@
 
 ## 1. 목표와 범위
 
-**목표:** PureThermal + 셔터 없는 FLIR Lepton 3.5를 위한 Windows용 실시간 열화상 뷰어·측정 도구. 단일 실행 파일(`thermalview.exe`)로 배포합니다.
+**목표:** PureThermal + 셔터 없는 FLIR Lepton 3.5를 위한 Windows용 실시간 열화상 뷰어·측정 도구. 단일 실행 파일(`thermalview.exe`)로 배포합니다. 단계 9부터 Thermal Master P3(256×192)도 지원합니다.
 
 **1차 범위(MVP):**
 
@@ -21,7 +21,7 @@
 | F8 | 연결 감시 | 2초간 프레임이 없으면 스트림 재시작, 실패 시 재연결 루프와 "USB를 다시 꽂으세요" 안내 |
 | F9 | 스냅샷 | 컬러 PNG + 온도 원본(16비트 PNG, 단위 0.01 K) + JSON 메타 |
 
-**2차 이후:** Box/Line 측정, 히스토그램, 시간-온도 그래프, 측정표 CSV, 온도 시퀀스 녹화·재생, MP4, 온도 경보, 원격 제어(TCP), 보정, 웹캠 합성. 타사 카메라와 제조사 파일 형식은 범위 밖입니다.
+**2차 이후:** Box/Line 측정, 히스토그램, 시간-온도 그래프, 측정표 CSV, 온도 시퀀스 녹화·재생, MP4, 온도 경보, 원격 제어(TCP), 보정, 웹캠 합성, Thermal Master P3(단계 9). 그 밖의 타사 카메라와 제조사 파일 형식은 범위 밖입니다.
 
 ## 2. 확정된 기술 결정
 
@@ -32,11 +32,13 @@
 | 창 시스템 | `crates/winit`: winit 0.30.13에 DPI 패치 1건 적용(`[patch.crates-io]`) | 배율이 다른 모니터로 끌면 창이 커지며 넘어가지 못하는 버그. 수정이 winit 0.31에만 있고 eframe 0.37은 0.30을 씀. eframe이 winit 0.31 이상을 쓰면 제거(`crates/winit/PATCHES.md`) |
 | 영상 수신 | 방식 1: 패치한 libuvc를 `cc`로 정적 빌드해 FFI | Windows에서 검증된 경로 |
 | libusb | `libusb1-sys`의 `vendored` 기능(정적 링크) | DLL 배포 불필요 |
+| P3 수신 | `rusb` 0.9(MIT, 같은 `libusb1-sys` 위의 안전 래퍼)로 제조사 전용 제어·bulk 전송 | 새 `unsafe` 없이 libusb를 씀. P3는 UVC가 아니라 libuvc를 쓸 수 없음 |
 | pthread | `crates/libuvc-sys/compat/pthread.h` 자체 shim(Win32 SRWLOCK + CONDITION_VARIABLE) | libuvc가 쓰는 함수가 13개뿐 |
 | 바인딩 | 손으로 쓴 최소 FFI(`bindgen` 미사용) | libclang 설치 의존 제거 |
 | 설정 저장 | `serde` + JSON, `%APPDATA%\thermalview\config.json` | 이식성, 사람이 읽을 수 있음 |
 | 이미지 저장 | `image` (PNG 8비트 컬러, 16비트 그레이) | 16비트 PNG로 온도 원본을 손실 없이 저장 |
 | 동영상(MP4) | Windows 내장 Media Foundation H.264 인코더(`windows` 크레이트, `src/video/mf.rs`). 글자는 `ab_glyph`로 Windows 글꼴을 그림 | DLL 동봉·라이선스·특허 부담 없음. FFmpeg+x264는 앱 전체가 GPL이 되고, OpenH264는 소스 빌드 시 특허 비용이 면제되지 않음 |
+| 웹캠 | Media Foundation Source Reader(`windows` 크레이트, `src/webcam/mf.rs`) | MP4와 같은 Windows 기능이라 새 의존성이 없음. `nokhwa` 등은 같은 API를 감싸면서 크레이트가 많이 늘어남 |
 | 라이선스 | **미정**. 결정 전까지 GPL 코드(thermal-cat 등)는 복사하지 않는다 | 사용자 결정 사항 |
 
 방식 3(nokhwa/Media Foundation, Zadig 불필요)은 MVP 이후 별도 실험으로 검증합니다. 캡처 계층은 `trait`로 분리해 나중에 백엔드를 추가할 수 있게 합니다.
@@ -47,7 +49,7 @@
 thermalview/
 ├─ Cargo.toml                 # workspace + 앱 크레이트
 ├─ crates/
-│  ├─ libuvc-sys/             # FFI 계층 (unsafe는 여기, src/camera/uvc.rs, src/video/mf.rs에만)
+│  ├─ libuvc-sys/             # FFI 계층 (unsafe는 여기, src/camera/uvc.rs, src/video/mf.rs, src/webcam/mf.rs에만)
 │  │  ├─ build.rs             # libuvc C 소스 + shim 컴파일, libusb1-sys에 링크
 │  │  ├─ compat/              # pthread.h, sys/time.h shim (MSVC 전용)
 │  │  ├─ vendor/libuvc/       # GetThermal 세션에서 패치한 libuvc (BSD, LICENSE.txt 유지)
@@ -56,8 +58,9 @@ thermalview/
 ├─ src/
 │  ├─ main.rs                 # 진입점, 로깅, eframe 실행
 │  ├─ camera/
-│  │  ├─ mod.rs               # 상수(VID/PID, 160×120)와 공개 타입
-│  │  ├─ worker.rs            # 카메라 작업 스레드: 연결·재연결, 정지 감지, 설정 재적용, 프레임 대기열
+│  │  ├─ mod.rs               # 상수(VID/PID, 160×120), 카메라 종류(Source/Kind)와 공개 타입
+│  │  ├─ worker.rs            # 카메라 작업 스레드: 종류 선택, 연결·재연결, 정지 감지, 설정 재적용, 프레임 대기열
+│  │  ├─ p3.rs                # Thermal Master P3: 명령(CRC), 프레임 조립(순수), rusb 세션
 │  │  ├─ uvc.rs               # libuvc 안전 래퍼(Context/Device/Handle/Stream)
 │  │  └─ lepton.rs            # XU 명령(CCI): 명령ID → (unit, control) 변환과 타입별 get/set
 │  ├─ thermal/
@@ -65,7 +68,8 @@ thermalview/
 │  │  ├─ palette.rs           # 256색 LUT
 │  │  ├─ range.rs             # 눈금 범위 모드
 │  │  ├─ measure.rs           # Spot(이후 Box/Line)
-│  │  └─ calibration.rs       # 방사율·반사 온도·기준점 보정
+│  │  ├─ calibration.rs       # 방사율·반사 온도·기준점 보정
+│  │  └─ upscale.rs           # 4배 업스케일(위너 선명화 + Lanczos)
 │  ├─ remote/
 │  │  ├─ mod.rs               # 원격 명령 해석(순수 함수), 응답 형식, base64
 │  │  └─ server.rs            # TCP 수신 스레드와 연결별 스레드
@@ -73,6 +77,10 @@ thermalview/
 │  │  ├─ mod.rs               # MP4 쓰기 스레드(Mp4Writer)
 │  │  ├─ overlay.rs           # 녹화 화면 그리기(확대, 표식, 색 막대, 글자), NV12 변환. 순수 함수
 │  │  └─ mf.rs                # Media Foundation H.264 인코더 (unsafe)
+│  ├─ webcam/
+│  │  ├─ mod.rs               # 웹캠 수신 스레드(Webcam), 장치 목록
+│  │  ├─ blend.rs             # 정렬·합성 방식·윤곽 계산. 순수 함수
+│  │  └─ mf.rs                # Media Foundation 장치 열거·Source Reader (unsafe)
 │  ├─ storage/snapshot.rs
 │  ├─ settings.rs
 │  └─ app/                    # egui 화면: 영상 뷰, 제어 패널, 상태 줄
@@ -106,6 +114,7 @@ thermalview/
 - **원격 제어 스레드(`remote/server.rs`):** 수신 스레드 1개와 연결마다 스레드 1개. 명령 줄을 해석해 채널로 UI 스레드에 넘기고 `request_repaint()`로 깨운 뒤 응답을 기다립니다(최대 3초). 앱 상태는 UI 스레드만 만지므로 잠금이 없습니다.
 - **저장:** 스냅샷 파일 3개는 합쳐 50 KB 정도라 UI 스레드에서 바로 씁니다. 시퀀스 녹화(단계 3)는 별도 스레드로 합니다.
 - **MP4 쓰기 스레드(`video/mod.rs`):** UI 스레드는 프레임마다 컬러 영상과 표식 목록(`Scene`)만 보내고, 그리기·NV12 변환·인코딩은 이 스레드가 합니다. COM과 Media Foundation 객체는 이 스레드에서 만들고 이 스레드에서만 씁니다.
+- **웹캠 수신 스레드(`webcam/mod.rs`):** 합성을 켰을 때만 1개. 장치를 열고 프레임마다 RGBA 변환과 윤곽 계산을 한 뒤 최신 1장을 `Arc`로 바꿔 넣고 `request_repaint()`를 부릅니다. UI는 `ui`에서 이 영상을 텍스처로 올리고, MP4에는 같은 `Arc`를 넘깁니다. 끌 때는 정지 표시 후 최대 2초 기다립니다.
 
 ## 6. 단계별 작업
 
@@ -226,11 +235,73 @@ v2 압축과 드래그 편집은 위 자동 시험으로 확인했고, 앱 화�
 - 녹화 중에 앱을 닫으면 파일이 마무리되어 정상으로 재생됩니다(40프레임).
 - 재생 화면 녹화(`.tvseq` → MP4)는 자동 시험으로만 확인했습니다. 도구 막대의 MP4 버튼은 아직 화면에서 직접 보지 않았습니다.
 
+### 단계 8 — 웹캠 합성
+
+일반 카메라(웹캠) 영상을 열화상과 겹쳐, 뜨거운 곳이 실제 물체의 어디인지 알아보기 쉽게 합니다.
+
+| 항목 | 기준 |
+| --- | --- |
+| 방식 | 겹치기: 웹캠 영상 위에 열화상을 반투명하게 그림(열화상 불투명도 0~100%, 기본 50%). 윤곽: 열화상 위에 웹캠 영상의 윤곽선(Sobel)을 흰 선으로 그림(진하기 0~100%, 기본 80%) |
+| 좌표 | 화면과 측정은 계속 열화상 화소(160×120) 기준. 웹캠 영상을 열화상 화면에 맞춰 늘이고 옮김. Spot·Box·Line·경보·CSV는 바뀌지 않음 |
+| 정렬 | 크기(열화상 폭 대비 0.5~3배, 웹캠 가로세로 비 유지), 가로·세로 위치(화면 폭·높이의 ±50%). 두 카메라 위치가 달라(시차) 한 거리에서만 정확히 맞음을 화면에 안내 |
+| 수신 | Media Foundation Source Reader(`src/webcam/mf.rs`, unsafe). 장치가 주는 형식 중 가로 640에 가장 가까운 것을 골라 RGB32로 변환받음. 별도 스레드에서 동기 `ReadSample`, 최신 1장만 보관. 윤곽은 이 스레드에서 미리 계산 |
+| 장치 | 목록에서 선택. 이름과 장치 경로(symbolic link)를 설정에 저장하고, 켜 둔 채 종료했으면 다음 실행 때 다시 연결. 목록 조회는 UI를 멈추지 않도록 별도 스레드. PureThermal은 WinUSB 드라이버라 목록에 나오지 않음 |
+| 오류 | 열기 실패·연결 끊김은 상태를 표시하고 스레드를 끝냄(자동 재연결 없음, 다시 켜면 재시도). 접근 거부(0x80070005)는 Windows 개인 정보 설정의 카메라 권한을 안내 |
+| 대상 | 실시간 영상에만. 재생 중에는 합성하지 않음(`.tvseq`에 웹캠 영상이 없으므로 다른 시각의 장면이 겹치는 것을 막음) |
+| MP4 | 화면과 같은 방식으로 합성해 녹화 |
+| 스냅샷 | 컬러 PNG와 16비트 PNG는 지금처럼 열화상만. 합성 중이면 웹캠 사진을 `_webcam.png`로 원래 해상도로 따로 저장하고, JSON에 장치 이름·방식·정렬값을 기록 |
+| 원격 | 명령 없음 |
+
+2026-11-26 실제 장치 확인(노트북 내장 USB2.0 HD UVC WebCam, `examples/webcam`, 임시 설정으로 앱 최소화, 원격 명령으로 조작):
+- 장치 목록 조회 6 ms, 640×480 RGB32로 열림, 첫 영상까지 약 0.65초, 끄기 약 0.3초. 이 웹캠은 2-D 버퍼 없이 위에서 아래로 쌓인 버퍼(stride +2560)를 줌.
+- 웹캠을 켠 채로 열화상 수신 8.9 fps 유지. 스냅샷에 `_webcam.png`(640×480)와 JSON의 `webcam` 항목이 기록됨.
+- 겹치기 50%로 녹화한 MP4(55프레임)를 다시 풀었더니 영상 부분 평균 밝기가 47.4로, 열화상만일 때(91.5)의 절반에 글자 표시가 더해진 값이었음(웹캠 쪽 평균 0.5).
+- 시험할 때 웹캠 앞이 어두워(최대 밝기 15, 웹캠 속도 7~12 fps) 영상 방향, 정렬, 윤곽 방식은 실제 장면으로 확인하지 못했고 자동 시험으로만 확인함. 화면 표시와 설정 항목도 아직 직접 보지 않음.
+
+### 단계 9 — Thermal Master P3
+
+Thermal Master P3(VID 0x3474, PID 0x45A2)는 UVC가 아니라 제조사 전용 USB 프로토콜을 씁니다. 프로토콜은 공개 역공학 자료 [jvdillon/p3-ir-camera](https://github.com/jvdillon/p3-ir-camera)의 `P3_PROTOCOL.md`(Apache-2.0)와 [xaionaro-go/thermalmaster](https://github.com/xaionaro-go/thermalmaster)의 문서를 근거로 새로 구현했습니다(코드는 복사하지 않음).
+
+| 항목 | 기준 |
+| --- | --- |
+| 장치 | 인터페이스 0(제어)과 1(alt 0 정지, alt 1 bulk IN 0x81). Windows에서 WinUSB 드라이버가 붙어 있어야 함 |
+| 명령 | 18바이트: 종류(2, 큰 엔디언), 파라미터(2), 레지스터(2), 0×6, 응답 길이(2), 0×2, CRC16-CCITT(초기값 0, 0~15바이트, 작은 엔디언). 보낸 뒤 상태 1바이트(0xC1/0x22)를 읽고, 응답이 있으면 0xC1/0x21로 읽은 뒤 상태를 다시 읽음 |
+| 시작 | start_stream 명령 → 1초 → 인터페이스 1 alt 1 → 0x40/0xEE(wIndex 1) → 2초 → bulk 읽기 1회(버림) → start_stream 다시. 대기 중에도 정지 요청을 확인 |
+| 정지 | 인터페이스 1 alt 0, 인터페이스 해제 |
+| 프레임 | 시작 표식(12바이트, 0x0C + 0x8C/0x8D) + 화소 256×386×2바이트 + 끝 표식(12바이트 단독 전송, 0x8E/0x8F). 두 표식의 카운터(cnt1)가 같을 때만 사용. 화소의 0~191행은 장치가 밝기 조정한 IR 영상, 192~193행은 메타, 194~385행이 온도(1/64 K) |
+| 읽기 | 16 KiB씩 bulk 읽기(500 ms 타임아웃)해 이어 붙임. 한 번에 프레임 크기만큼 읽으면 Windows에서 장치 오류가 난다는 보고가 있어 따름. 12바이트 읽기가 프레임 끝. 크기가 맞지 않거나 표식이 틀리면 버리고 다음 시작 표식부터 다시 맞춤(셔터 직후의 비정상 프레임도 여기서 버려짐) |
+| 온도 | `kelvin_per_count` = 1/64. 앱의 방사율·기준점 보정, 측정, 기록은 Lepton과 같은 경로 |
+| 감도 | 고감도(−20~150 °C, 기본) / 저감도(0~550 °C). 연결할 때와 바꿀 때 명령으로 적용(장치에서 읽어 오는 명령은 없음) |
+| 셔터 | P3는 셔터가 있고 약 90초마다 스스로 보정함. "셔터 보정" 버튼은 확인 없이 바로 명령을 보냄(규칙 4는 셔터 없는 Lepton에만 해당). 원격 명령에는 넣지 않음 |
+| 카메라 선택 | 설정의 카메라 종류: 자동(PureThermal을 먼저 찾고 없으면 P3), PureThermal, P3. 바꾸면 지금 연결을 끊고 새 종류를 찾음 |
+| 상태 폴링 | 없음(P3에는 FPA 온도 등 읽을 명령이 알려지지 않음). 2초 정지 감지와 재연결은 Lepton과 같음 |
+| 부하 | 초당 약 25장. 시퀀스 녹화는 Lepton 기준(약 0.58 GB/시간)보다 약 7배 커질 것으로 예상. MP4는 4배 확대해 1120×768 |
+
+2026-11-27 실제 장치 확인(P3, 펌웨어 00.00.02.17):
+- `examples/p3` 10초: 장치 열기 50 ms, 시작 순서 3.5초, 25.00 fps, 버린 프레임 0, 가장 긴 간격 52 ms. 온도 15~22 °C(실내).
+- 셔터 보정 명령: 셔터가 닫힌 약 0.8초 동안 프레임이 없고, 직후 비정상 프레임 2장을 버린 뒤 정상 수신. 2초 정지 감지에 걸리지 않음.
+- 앱(임시 설정, 카메라 종류 P3, 최소화, 원격 명령): 25.0 fps, 화소 온도·Spot·스냅샷(256×192 컬러·16비트 PNG, JSON `kelvin_per_count` 0.015625, 장치 "P3")·MP4(6초에 154프레임) 정상. CPU는 코어 하나의 약 10%.
+- 화면의 카메라 종류 선택과 P3 설정 항목, 실행 중 종류 전환, P3 USB 분리는 아직 직접 확인하지 않음.
+
+### 단계 10 — 업스케일
+
+[stared/thermal-upscale](https://github.com/stared/thermal-upscale)(MIT)을 참고했습니다. 그 도구는 P3 사진을 센서 해상도로 되돌린 뒤 위너 디컨볼루션(가우스 PSF σ 0.81)으로 흐림을 되돌리고, Upscayl의 초해상도 신경망으로 4배 키웁니다(사진 한 장에 0.4~2초). 여기서는 신경망 대신 Lanczos-3 보간을 써서 매 프레임 실시간으로 처리합니다.
+
+| 항목 | 기준 |
+| --- | --- |
+| 계산 | `thermal/upscale.rs`(순수 함수). 원시값에 11×11 위너 커널(σ 0.81, 합 1이라 평평한 장면의 온도 유지)을 적용한 뒤 Lanczos-3로 가로·세로 4배. 결과를 원래 영상과 같은 범위·팔레트로 칠함(`colorize_f32`) |
+| 선명화 | 없음 / 보통(K 0.01, 기본) / 강하게(K 0.001, 참고 도구 값). 강할수록 세부가 또렷하지만 센서 잡음도 커짐 |
+| 적용 | 설정 "4배 업스케일"(기본 꺼짐). 화면(LINEAR 필터), MP4(영상 영역을 업스케일 영상으로 채움), 스냅샷(`_x4.png` 추가, JSON `upscale`). 측정·경보·CSV·16비트 PNG는 계속 센서 화소 |
+| 부하 | 256×192 → 1024×768에 선명화 포함 약 2.7 ms/프레임(없으면 1.8 ms). 앱 전체 CPU는 켰을 때 코어 하나의 약 31~37%(끄면 약 10%, 최적화 전 측정) |
+| AI 업스케일 | Upscayl(별도 설치 프로그램)을 부르는 신경망 경로는 넣지 않음. 설치가 필요한 외부 프로그램이라 사용자 결정 사항 |
+
+2026-11-27 확인: P3 실시간에서 25 fps 유지, `_x4.png` 1024×768 저장. 같은 프레임 비교(`examples/upscale`)에서 보통은 벽 줄눈·윤곽이 또렷해지고 잡음이 조금 늘었으며, 강하게는 잡음이 눈에 띔. 화면에서 켜고 끄는 조작은 자동 시험으로만 확인.
+
 남은 일: USB 물리 분리 시험, 렌즈를 가린 FFC 시험, 라이선스·배포 결정(10절).
 
 ## 7. 코드 규칙
 
-- `unsafe`는 `crates/libuvc-sys`, `src/camera/uvc.rs`, `src/video/mf.rs`(Media Foundation COM 호출)에만 둡니다. 각 `unsafe` 블록 위에 안전 조건을 주석으로 적습니다. 외부 코드를 그대로 가져온 `crates/winit`은 이 규칙의 대상이 아닙니다.
+- `unsafe`는 `crates/libuvc-sys`, `src/camera/uvc.rs`, `src/video/mf.rs`·`src/webcam/mf.rs`(Media Foundation COM 호출)에만 둡니다. 각 `unsafe` 블록 위에 안전 조건을 주석으로 적습니다. 외부 코드를 그대로 가져온 `crates/winit`은 이 규칙의 대상이 아닙니다.
 - 캡처·제어 경로에서 `unwrap`/`expect` 금지. 오류는 `anyhow::Result` 또는 전용 오류 타입으로 UI까지 올려 상태 줄에 표시합니다.
 - `thermal/` 모듈은 장치 없이 테스트할 수 있어야 합니다(순수 함수). 팔레트, 범위, 통계, Spot 계산에 단위 테스트를 둡니다.
 - 커밋 전: `cargo fmt`, `cargo clippy --all-targets`(경고 0 목표), `cargo test`.
@@ -243,6 +314,14 @@ cargo build --release
 .\target\release\thermalview.exe
 # 수신 검증
 cargo run --release --example grab
+# 웹캠 확인(영상은 저장하지 않고 크기·속도·밝기만 출력)
+cargo run --release --example webcam
+# Thermal Master P3 수신 확인(장치 정보, fps, 버린 프레임, 온도 범위)
+cargo run --release --example p3
+# 업스케일 비교: 스냅샷의 16비트 PNG로 센서 화소 | 없음 | 보통 | 강하게를 나란히 저장
+cargo run --release --example upscale <파일_raw16.png> [출력.png]
+# PureThermal 프레임 간격(끊김) 측정: [초] [상태 조회 간격 ms, 0=조회 없음]
+cargo run --release --example gaps 120 5000
 ```
 
 사전 조건: Visual Studio Build Tools(C 컴파일러), PureThermal에 WinUSB 드라이버(Zadig: Options > List All Devices, "Ignore Hubs or Composite Parents" 해제 후 Composite Parent에 설치).

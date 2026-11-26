@@ -99,9 +99,33 @@ pub fn colorize(raw: &[u16], lo: u16, hi: u16, lut: &[[u8; 3]; 256], out: &mut V
     }
 }
 
+/// [`colorize`] for fractional raw values (an upscaled image), with the same mapping.
+pub fn colorize_f32(raw: &[f32], lo: u16, hi: u16, lut: &[[u8; 3]; 256], out: &mut Vec<u8>) {
+    out.clear();
+    out.reserve(raw.len() * 4);
+    let span = (hi.saturating_sub(lo)).max(1) as f32;
+    let lo = lo as f32;
+    for &v in raw {
+        let t = ((v - lo) / span).clamp(0.0, 1.0);
+        let c = lut[(t * 255.0).round() as usize];
+        out.extend_from_slice(&[c[0], c[1], c[2], 255]);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fractional_colorize_matches_integer_colorize() {
+        let lut = Palette::Ironbow.lut();
+        let raw = [0u16, 100, 137, 150, 199, 200, 999];
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        colorize(&raw, 100, 200, &lut, &mut a);
+        let f: Vec<f32> = raw.iter().map(|&v| v as f32).collect();
+        colorize_f32(&f, 100, 200, &lut, &mut b);
+        assert_eq!(a, b);
+    }
 
     #[test]
     fn lut_endpoints_match_stops() {

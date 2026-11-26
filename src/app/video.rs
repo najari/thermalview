@@ -5,7 +5,8 @@ use std::time::SystemTime;
 
 use super::ThermalApp;
 use crate::thermal::shapes::ShapeKind;
-use crate::video::overlay::{Mark, Scene, MAX_COLOR, MIN_COLOR};
+use crate::thermal::upscale::FACTOR;
+use crate::video::overlay::{Mark, Scene, WebcamLayer, MAX_COLOR, MIN_COLOR};
 use crate::video::Mp4Writer;
 
 impl ThermalApp {
@@ -80,7 +81,7 @@ impl ThermalApp {
     }
 
     /// The current frame with the same markers and labels as the image view.
-    fn video_scene(&self, t: f64) -> Option<Scene> {
+    pub(super) fn video_scene(&self, t: f64) -> Option<Scene> {
         let (f, st) = (self.frame.as_ref()?, self.stats.as_ref()?);
         if self.rgba.len() != f.width * f.height * 4 {
             return None;
@@ -152,6 +153,10 @@ impl ThermalApp {
             unit,
             caption,
             marks,
+            webcam: super::webcam::layer(self)
+                .map(|(picture, overlay)| WebcamLayer { picture, overlay }),
+            upscaled: (self.rgba_up.len() == self.rgba.len() * FACTOR * FACTOR)
+                .then(|| self.rgba_up.clone()),
         })
     }
 }

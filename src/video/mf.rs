@@ -1,6 +1,6 @@
 //! H.264/MP4 encoding with the encoder built into Windows (Media Foundation sink writer).
 //!
-//! This file and the camera driver are the only places with `unsafe` code
+//! This file, `webcam/mf.rs` and the camera driver are the only places with `unsafe` code
 //! (docs/DEVELOPMENT.md §7). Every object here is created and used on one thread: the MP4
 //! writer thread.
 
@@ -20,13 +20,14 @@ use windows::Win32::Media::MediaFoundation::{
 };
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
 
-/// COM and Media Foundation started on the current thread, stopped again on drop.
-struct Runtime {
+/// COM and Media Foundation started on the current thread, stopped again on drop. Keep it on
+/// that thread and drop it after every Media Foundation object made there.
+pub(crate) struct Runtime {
     com: bool,
 }
 
 impl Runtime {
-    fn start() -> anyhow::Result<Self> {
+    pub(crate) fn start() -> anyhow::Result<Self> {
         // SAFETY: no pointers are passed. A successful call (S_OK or S_FALSE) is balanced by
         // CoUninitialize in Drop; Runtime lives inside H264Writer, which stays on this thread.
         let com = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.is_ok();

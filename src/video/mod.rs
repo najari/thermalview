@@ -4,7 +4,7 @@
 //! ([`overlay`]), converts it to NV12 and feeds the encoder ([`mf`]). The file is only playable
 //! once [`Mp4Writer::finish`] (or drop) has finalized it.
 
-mod mf;
+pub(crate) mod mf;
 pub mod overlay;
 
 use std::path::{Path, PathBuf};
@@ -178,6 +178,8 @@ mod tests {
                 at: (80, 60),
                 text: "S1 30.0°C".into(),
             }],
+            webcam: None,
+            upscaled: None,
         }
     }
 

@@ -7,6 +7,7 @@ use std::time::Instant;
 use super::{DragOp, ThermalApp, Tool};
 use crate::thermal::measure::Spots;
 use crate::thermal::shapes::{Shape, ShapeKind, Shapes};
+use crate::webcam::blend::Mode;
 
 const BAR_WIDTH: f32 = 18.0;
 const BAR_LABELS: f32 = 70.0;
@@ -14,6 +15,7 @@ pub(super) const SHAPE_COLOR: Color32 = Color32::from_rgb(120, 255, 120);
 
 /// Draw the image view. Returns true if the measurements changed.
 pub(super) fn image_view(ui: &mut egui::Ui, app: &mut ThermalApp) -> bool {
+    let webcam = super::webcam::view_layer(app);
     let (Some(tex), Some(f), Some(st)) = (&app.texture, &app.frame, &app.stats) else {
         ui.centered_and_justified(|ui| {
             ui.label("영상을 기다리는 중…");
@@ -33,12 +35,33 @@ pub(super) fn image_view(ui: &mut egui::Ui, app: &mut ThermalApp) -> bool {
         Sense::click_and_drag(),
     );
     let img_rect = Rect::from_min_size(resp.rect.min, img_size);
-    painter.image(
-        tex.id(),
-        img_rect,
-        Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
-        Color32::WHITE,
-    );
+    let full_uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
+    match &webcam {
+        None => {
+            painter.image(tex.id(), img_rect, full_uv, Color32::WHITE);
+        }
+        Some(cam) => {
+            // Same placement as the MP4 (webcam::blend), in thermal pixels.
+            let [x0, y0, x1, y1] = cam.rect;
+            let cam_rect = Rect::from_min_max(
+                img_rect.min + vec2(x0, y0) * scale,
+                img_rect.min + vec2(x1, y1) * scale,
+            );
+            let clipped = painter.with_clip_rect(img_rect);
+            let fade = Color32::WHITE.gamma_multiply(cam.strength);
+            match cam.mode {
+                Mode::Blend => {
+                    painter.rect_filled(img_rect, 0.0, Color32::BLACK);
+                    clipped.image(cam.tex, cam_rect, full_uv, Color32::WHITE);
+                    painter.image(tex.id(), img_rect, full_uv, fade);
+                }
+                Mode::Edges => {
+                    painter.image(tex.id(), img_rect, full_uv, Color32::WHITE);
+                    clipped.image(cam.tex, cam_rect, full_uv, fade);
+                }
+            }
+        }
+    }
 
     let to_screen = |x: usize, y: usize| {
         pos2(

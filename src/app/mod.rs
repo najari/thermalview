@@ -7,6 +7,7 @@ mod playback;
 mod remote;
 mod video;
 mod view;
+mod webcam;
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime};
@@ -14,16 +15,18 @@ use std::time::{Duration, Instant, SystemTime};
 use eframe::egui;
 
 use crate::camera::lepton::ShutterMode;
-use crate::camera::{Camera, CameraStatus, Command, ConnState};
+use crate::camera::p3::Gain;
+use crate::camera::{Camera, CameraStatus, Command, ConnState, Kind, Source};
 use crate::settings::Settings;
 use crate::storage::csv_log::{self, CsvLog};
 use crate::storage::sequence::{self, SeqHeader, SeqWriter};
-use crate::storage::snapshot::{self, ShapeReading, SnapshotMeta, SpotReading};
+use crate::storage::snapshot::{self, ShapeReading, SnapshotMeta, SpotReading, WebcamInfo};
 use crate::thermal::frame::{FrameStats, ThermalFrame};
 use crate::thermal::history::{History, Sample};
 use crate::thermal::palette::{self, Palette};
 use crate::thermal::range::{AutoRange, RangeMode};
 use crate::thermal::shapes::{Grab, Shape, ShapeKind};
+use crate::thermal::upscale::{self, Sharpen, Upscaler};
 use crate::video::Mp4Writer;
 
 /// What a left click / drag on the image does.
@@ -75,6 +78,9 @@ pub struct ThermalApp {
     texture: Option<egui::TextureHandle>,
     /// `rgba` changed since the texture was last uploaded.
     texture_dirty: bool,
+    /// The 4× upscaled image of the current frame (empty when upscaling is off).
+    rgba_up: Vec<u8>,
+    upscaler: Option<Upscaler>,
     lut: (Palette, [[u8; 3]; 256]),
     auto_range: AutoRange,
     /// Range used for the current image, in display units.
@@ -103,6 +109,7 @@ pub struct ThermalApp {
     alarms: alarms::AlarmState,
     cal: calibration::CalState,
     remote: remote::RemoteState,
+    webcam: webcam::WebcamState,
 }
 
 impl ThermalApp {
@@ -110,7 +117,12 @@ impl ThermalApp {
         install_korean_font(&cc.egui_ctx);
         let settings = Settings::load();
         let ctx = cc.egui_ctx.clone();
-        let camera = Camera::start(settings.shutter_mode, move || ctx.request_repaint());
+        let config = crate::camera::Config {
+            source: settings.camera,
+            shutter_mode: settings.shutter_mode,
+            gain: settings.p3_gain,
+        };
+        let camera = Camera::start(config, move || ctx.request_repaint());
         Self::with_camera(settings, camera)
     }
 
@@ -125,6 +137,8 @@ impl ThermalApp {
             rgba: Vec::new(),
             texture: None,
             texture_dirty: false,
+            rgba_up: Vec::new(),
+            upscaler: None,
             lut,
             auto_range: AutoRange::default(),
             display_range: (20.0, 40.0),
@@ -144,6 +158,7 @@ impl ThermalApp {
             alarms: alarms::AlarmState::default(),
             cal: calibration::CalState::default(),
             remote: remote::RemoteState::default(),
+            webcam: webcam::WebcamState::default(),
         }
     }
 
@@ -462,6 +477,18 @@ impl ThermalApp {
         let lo = f.raw_from_value(self.display_range.0);
         let hi = f.raw_from_value(self.display_range.1);
         palette::colorize(&f.raw, lo, hi, &self.lut.1, &mut self.rgba);
+        let up = self.settings.upscale;
+        if up.enabled {
+            let u = match &mut self.upscaler {
+                Some(u) if u.sharpen() == up.sharpen => u,
+                slot => slot.insert(Upscaler::new(up.sharpen)),
+            };
+            let field = u.upscale(&f.raw, f.width, f.height);
+            palette::colorize_f32(&field, lo, hi, &self.lut.1, &mut self.rgba_up);
+        } else {
+            self.rgba_up.clear();
+            self.upscaler = None;
+        }
         self.texture_dirty = true;
     }
 
@@ -473,13 +500,22 @@ impl ThermalApp {
             return;
         }
         self.texture_dirty = false;
-        let image = egui::ColorImage::from_rgba_unmultiplied([f.width, f.height], &self.rgba);
+        // The upscaled image when there is one (smooth), else the sensor pixels (sharp squares).
+        let (n, filter) = (upscale::FACTOR, egui::TextureOptions::LINEAR);
+        let (image, options) = if self.rgba_up.len() == self.rgba.len() * n * n {
+            let size = [f.width * n, f.height * n];
+            (
+                egui::ColorImage::from_rgba_unmultiplied(size, &self.rgba_up),
+                filter,
+            )
+        } else {
+            let size = [f.width, f.height];
+            let image = egui::ColorImage::from_rgba_unmultiplied(size, &self.rgba);
+            (image, egui::TextureOptions::NEAREST)
+        };
         match &mut self.texture {
-            Some(t) => t.set(image, egui::TextureOptions::NEAREST),
-            None => {
-                self.texture =
-                    Some(ctx.load_texture("thermal", image, egui::TextureOptions::NEAREST))
-            }
+            Some(t) => t.set(image, options),
+            None => self.texture = Some(ctx.load_texture("thermal", image, options)),
         }
     }
 
@@ -489,6 +525,10 @@ impl ThermalApp {
             self.notify("저장할 영상이 없습니다");
             return Err("no frame yet".into());
         };
+        let cam = webcam::layer(self);
+        let n = upscale::FACTOR;
+        let upscaled = (self.rgba_up.len() == f.width * f.height * 4 * n * n)
+            .then_some(self.rgba_up.as_slice());
         let meta = SnapshotMeta {
             app: "thermalview",
             version: env!("CARGO_PKG_VERSION"),
@@ -541,9 +581,17 @@ impl ThermalApp {
                 .calibration
                 .is_some()
                 .then(|| self.settings.calibration.clone()),
+            webcam: cam.as_ref().map(|(pic, overlay)| WebcamInfo {
+                device: self.settings.webcam.device_name.clone(),
+                width: pic.width,
+                height: pic.height,
+                overlay: *overlay,
+            }),
+            upscale: upscaled.is_some().then_some(self.settings.upscale),
         };
         let dir = self.settings.snapshot_dir();
-        match snapshot::save(&dir, f, &self.rgba, &meta) {
+        let picture = cam.as_ref().map(|(pic, _)| pic.as_ref());
+        match snapshot::save(&dir, f, &self.rgba, upscaled, picture, &meta) {
             Ok(files) => {
                 self.notify(format!("저장됨: {}", files.color_png.display()));
                 Ok(files.color_png)
@@ -564,6 +612,21 @@ impl ThermalApp {
                 _ => egui::Color32::from_rgb(230, 160, 0),
             };
             ui.colored_label(color, format!("● {}", status.state.label()));
+            let mut source = self.settings.camera;
+            egui::ComboBox::from_label("카메라 종류")
+                .selected_text(source.label())
+                .show_ui(ui, |ui| {
+                    for s in Source::ALL {
+                        ui.selectable_value(&mut source, s, s.label());
+                    }
+                })
+                .response
+                .on_hover_text("자동은 PureThermal을 먼저 찾고, 없으면 Thermal Master P3를 찾습니다");
+            if source != self.settings.camera {
+                self.settings.camera = source;
+                self.camera.set_source(source);
+                self.mark_dirty();
+            }
             egui::Grid::new("cam_info").num_columns(2).show(ui, |ui| {
                 if let Some(d) = &status.device {
                     ui.label("장치");
@@ -578,6 +641,11 @@ impl ThermalApp {
                     ));
                     ui.end_row();
                 }
+                if let Some(fw) = &status.firmware {
+                    ui.label("펌웨어");
+                    ui.label(fw);
+                    ui.end_row();
+                }
                 ui.label("프레임");
                 ui.label(format!("{:.1} fps", status.fps));
                 ui.end_row();
@@ -587,59 +655,34 @@ impl ThermalApp {
                     ui.end_row();
                 }
                 ui.label("온도 단위");
-                ui.label(match status.kelvin_per_count {
-                    Some(k) => format!("TLinear {k} K"),
-                    None => "원시값(온도 아님)".into(),
+                ui.label(match (status.kelvin_per_count, status.kind) {
+                    (Some(k), Some(Kind::P3)) => format!("{k} K"),
+                    (Some(k), _) => format!("TLinear {k} K"),
+                    (None, _) => "원시값(온도 아님)".into(),
                 });
                 ui.end_row();
             });
             if status.state == ConnState::Busy {
-                ui.label("GetThermal 등 카메라를 쓰는 다른 프로그램을 닫아 주세요.");
+                ui.label("GetThermal, Thermal Master 프로그램 등 카메라를 쓰는 다른 프로그램을 닫아 주세요.");
             }
             if status.state == ConnState::Searching {
-                ui.label("PureThermal이 연결돼 있고 WinUSB 드라이버가 설치됐는지 확인하세요.");
+                ui.label(match source {
+                    Source::Auto => "PureThermal 또는 P3가 연결돼 있고 WinUSB 드라이버가 설치됐는지 확인하세요.",
+                    Source::PureThermal => "PureThermal이 연결돼 있고 WinUSB 드라이버가 설치됐는지 확인하세요.",
+                    Source::P3 => "P3가 연결돼 있고 WinUSB 드라이버가 설치됐는지 확인하세요.",
+                });
             }
 
             ui.separator();
-            ui.heading("Lepton 보정(FFC)");
-            let mut mode = self.settings.shutter_mode;
-            egui::ComboBox::from_label("셔터 모드")
-                .selected_text(mode.label())
-                .show_ui(ui, |ui| {
-                    for m in [
-                        ShutterMode::Manual,
-                        ShutterMode::Auto,
-                        ShutterMode::External,
-                    ] {
-                        ui.selectable_value(&mut mode, m, m.label());
-                    }
-                });
-            if mode != self.settings.shutter_mode {
-                self.settings.shutter_mode = mode;
-                self.camera.send(Command::SetShutterMode(mode));
-                self.mark_dirty();
-            }
-            if mode == ShutterMode::Auto {
-                ui.colored_label(
-                    egui::Color32::from_rgb(230, 120, 0),
-                    "셔터가 없는 모듈에서 AUTO는 장면이 잔상으로 남습니다.",
-                );
-            }
-            if let (Some(m), true) = (status.shutter_mode, status.state == ConnState::Streaming) {
-                if m != mode {
-                    ui.label(format!("카메라 현재값: {} (재적용 대기)", m.label()));
-                }
-            }
-            if let Some(s) = status.since_ffc_s {
-                ui.label(format!("마지막 FFC 이후 {}", fmt_duration(s)));
-            }
-            let can_ffc = status.state == ConnState::Streaming;
-            if ui
-                .add_enabled(can_ffc, egui::Button::new("FFC 실행…"))
-                .on_hover_text("렌즈를 완전히 가린 상태에서 실행하세요")
-                .clicked()
-            {
-                self.confirm_ffc = true;
+            // The connected camera, or the one asked for before anything connects.
+            let kind = status.kind.or(match source {
+                Source::P3 => Some(Kind::P3),
+                _ => None,
+            });
+            if kind == Some(Kind::P3) {
+                self.p3_controls(ui, status);
+            } else {
+                self.lepton_controls(ui, status);
             }
 
             ui.separator();
@@ -697,10 +740,34 @@ impl ThermalApp {
             changed |= ui
                 .checkbox(&mut self.settings.show_extremes, "최고·최저 위치 표시")
                 .changed();
+            changed |= ui
+                .checkbox(&mut self.settings.upscale.enabled, "4배 업스케일")
+                .on_hover_text(
+                    "센서 흐림을 되돌리는 선명화(위너 필터) 뒤 Lanczos 보간으로 4배 확대해 보여 줍니다. \
+                     MP4와 스냅샷(_x4.png)에도 들어갑니다. 측정값은 계속 센서 화소 기준입니다.",
+                )
+                .changed();
+            if self.settings.upscale.enabled {
+                let mut s = self.settings.upscale.sharpen;
+                egui::ComboBox::from_id_salt("upscale_sharpen")
+                    .selected_text(s.label())
+                    .show_ui(ui, |ui| {
+                        for v in Sharpen::ALL {
+                            ui.selectable_value(&mut s, v, v.label());
+                        }
+                    })
+                    .response
+                    .on_hover_text("강하게는 미세한 부분이 또렷해지지만 센서 잡음도 함께 커집니다");
+                changed |= s != self.settings.upscale.sharpen;
+                self.settings.upscale.sharpen = s;
+            }
             if changed {
                 self.mark_dirty();
                 self.render();
             }
+
+            ui.separator();
+            webcam::controls(ui, self);
 
             ui.separator();
             ui.heading("측정");
@@ -799,6 +866,78 @@ impl ThermalApp {
         });
     }
 
+    /// Shutter mode and FFC of the shutterless Lepton.
+    fn lepton_controls(&mut self, ui: &mut egui::Ui, status: &CameraStatus) {
+        ui.heading("Lepton 보정(FFC)");
+        let mut mode = self.settings.shutter_mode;
+        egui::ComboBox::from_label("셔터 모드")
+            .selected_text(mode.label())
+            .show_ui(ui, |ui| {
+                for m in [
+                    ShutterMode::Manual,
+                    ShutterMode::Auto,
+                    ShutterMode::External,
+                ] {
+                    ui.selectable_value(&mut mode, m, m.label());
+                }
+            });
+        if mode != self.settings.shutter_mode {
+            self.settings.shutter_mode = mode;
+            self.camera.send(Command::SetShutterMode(mode));
+            self.mark_dirty();
+        }
+        if mode == ShutterMode::Auto {
+            ui.colored_label(
+                egui::Color32::from_rgb(230, 120, 0),
+                "셔터가 없는 모듈에서 AUTO는 장면이 잔상으로 남습니다.",
+            );
+        }
+        if let (Some(m), true) = (status.shutter_mode, status.state == ConnState::Streaming) {
+            if m != mode {
+                ui.label(format!("카메라 현재값: {} (재적용 대기)", m.label()));
+            }
+        }
+        if let Some(s) = status.since_ffc_s {
+            ui.label(format!("마지막 FFC 이후 {}", fmt_duration(s)));
+        }
+        let can_ffc = status.state == ConnState::Streaming;
+        if ui
+            .add_enabled(can_ffc, egui::Button::new("FFC 실행…"))
+            .on_hover_text("렌즈를 완전히 가린 상태에서 실행하세요")
+            .clicked()
+        {
+            self.confirm_ffc = true;
+        }
+    }
+
+    /// Measurement range and shutter of the Thermal Master P3.
+    fn p3_controls(&mut self, ui: &mut egui::Ui, status: &CameraStatus) {
+        ui.heading("P3 설정");
+        let mut gain = self.settings.p3_gain;
+        egui::ComboBox::from_label("측정 범위")
+            .selected_text(gain.label())
+            .show_ui(ui, |ui| {
+                for g in [Gain::High, Gain::Low] {
+                    ui.selectable_value(&mut gain, g, g.label());
+                }
+            });
+        if gain != self.settings.p3_gain {
+            self.settings.p3_gain = gain;
+            self.camera.send(Command::SetGain(gain));
+            self.mark_dirty();
+        }
+        // The P3 has a real shutter: no need to cover the lens (unlike the Lepton, rule 4).
+        let streaming = status.state == ConnState::Streaming;
+        if ui
+            .add_enabled(streaming, egui::Button::new("셔터 보정"))
+            .on_hover_text("카메라가 셔터를 닫고 보정합니다. 약 90초마다 자동으로도 합니다.")
+            .clicked()
+        {
+            self.camera.send(Command::RunFfc);
+            self.notify("P3 셔터 보정을 실행했습니다.");
+        }
+    }
+
     fn ffc_dialog(&mut self, ctx: &egui::Context) {
         if !self.confirm_ffc {
             return;
@@ -848,6 +987,7 @@ impl ThermalApp {
         }
         remote::sync(self, ctx);
         remote::process(self, &status);
+        webcam::sync(self, ctx);
         self.save_settings_if_due(false);
         // Keep status fresh even when no frames arrive (disconnected / stalled).
         ctx.request_repaint_after(Duration::from_millis(500));
@@ -985,6 +1125,7 @@ impl eframe::App for ThermalApp {
 
         // After the panels: their controls may have recolored the image.
         self.upload_texture(&ctx);
+        webcam::upload_texture(self, &ctx);
         egui::CentralPanel::default().show(ui, |ui| {
             if view::image_view(ui, self) {
                 self.mark_dirty();
@@ -997,6 +1138,7 @@ impl eframe::App for ThermalApp {
 
     fn on_exit(&mut self) {
         self.remote.stop();
+        self.webcam.stop();
         self.save_settings_if_due(true);
         if let Some(log) = self.csv.take() {
             let _ = log.finish();
@@ -1078,6 +1220,45 @@ mod tests {
         assert!(app.texture_dirty);
         assert_eq!(app.stop_csv().unwrap().1, 5);
         assert_eq!(app.stop_seq().unwrap().1, 5);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A P3-sized frame with upscaling on: the view, the MP4 scene and the snapshot get the 4×
+    /// image; turning it off removes it everywhere.
+    #[test]
+    fn upscaling_reaches_view_video_and_snapshot() {
+        let dir = std::env::temp_dir().join(format!("thermalview_up_{}", std::process::id()));
+        let mut settings = Settings {
+            snapshot_dir: Some(dir.clone()),
+            ..Default::default()
+        };
+        settings.upscale.enabled = true;
+        let mut app = ThermalApp::with_camera(settings, Camera::disconnected());
+        let ctx = egui::Context::default();
+        let (w, h) = (256, 192);
+        let mut raw = vec![19_000u16; w * h];
+        raw[100 * w + 50] = 21_000;
+        app.camera
+            .inject(ThermalFrame::new(w, h, raw, Some(1.0 / 64.0)));
+        app.tick(&ctx);
+        assert_eq!(app.rgba_up.len(), w * h * 4 * 16);
+        let scene = app.video_scene(0.0).unwrap();
+        assert_eq!(scene.upscaled.as_ref().map(Vec::len), Some(w * h * 4 * 16));
+
+        app.take_snapshot(&CameraStatus::default()).unwrap();
+        let x4: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.to_string_lossy().ends_with("_x4.png"))
+            .collect();
+        assert_eq!(x4.len(), 1);
+        let img = image::open(&x4[0]).unwrap();
+        assert_eq!((img.width(), img.height()), (1024, 768));
+
+        app.settings.upscale.enabled = false;
+        app.render();
+        assert!(app.rgba_up.is_empty());
+        assert!(app.video_scene(0.0).unwrap().upscaled.is_none());
         std::fs::remove_dir_all(&dir).ok();
     }
 }

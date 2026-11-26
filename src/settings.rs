@@ -5,16 +5,24 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::camera::lepton::ShutterMode;
+use crate::camera::p3::Gain;
+use crate::camera::Source;
 use crate::thermal::alarm::AlarmConfig;
 use crate::thermal::calibration::Calibration;
 use crate::thermal::measure::Spots;
 use crate::thermal::palette::Palette;
 use crate::thermal::range::RangeMode;
 use crate::thermal::shapes::Shapes;
+use crate::thermal::upscale::UpscaleSettings;
+use crate::webcam::blend::Overlay;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
+    /// Which camera to look for.
+    pub camera: Source,
+    /// Thermal Master P3 measurement range.
+    pub p3_gain: Gain,
     /// Shutter-less module: MANUAL by default so the camera never runs FFC on an open lens.
     pub shutter_mode: ShutterMode,
     pub palette: Palette,
@@ -26,8 +34,23 @@ pub struct Settings {
     /// Emissivity, reflected temperature and reference correction.
     pub calibration: Calibration,
     pub show_extremes: bool,
+    /// 4× display upscaling (view, MP4, extra snapshot image).
+    pub upscale: UpscaleSettings,
     pub snapshot_dir: Option<PathBuf>,
     pub remote: RemoteSettings,
+    pub webcam: WebcamSettings,
+}
+
+/// Webcam overlay. Off by default.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WebcamSettings {
+    pub enabled: bool,
+    /// Windows device path of the chosen camera.
+    pub device: Option<String>,
+    /// Its name when it was chosen, shown while the device list loads.
+    pub device_name: String,
+    pub overlay: Overlay,
 }
 
 /// TCP remote control. Off by default; loopback only unless `allow_lan`.
@@ -52,6 +75,8 @@ impl Default for RemoteSettings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            camera: Source::default(),
+            p3_gain: Gain::default(),
             shutter_mode: ShutterMode::Manual,
             palette: Palette::default(),
             range: RangeMode::default(),
@@ -60,8 +85,10 @@ impl Default for Settings {
             alarms: AlarmConfig::default(),
             calibration: Calibration::default(),
             show_extremes: true,
+            upscale: UpscaleSettings::default(),
             snapshot_dir: None,
             remote: RemoteSettings::default(),
+            webcam: WebcamSettings::default(),
         }
     }
 }
@@ -119,6 +146,7 @@ mod tests {
         assert!(s.show_extremes);
         assert!(!s.remote.enabled, "remote control must be opt-in");
         assert!(!s.remote.allow_lan);
+        assert!(!s.webcam.enabled, "the webcam must be opt-in");
     }
 
     #[test]

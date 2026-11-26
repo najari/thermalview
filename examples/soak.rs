@@ -5,7 +5,7 @@
 use std::time::{Duration, Instant};
 
 use thermalview::camera::lepton::ShutterMode;
-use thermalview::camera::Camera;
+use thermalview::camera::{Camera, Config, Source};
 
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
@@ -13,7 +13,14 @@ fn main() {
         .nth(1)
         .and_then(|s| s.parse().ok())
         .unwrap_or(60);
-    let cam = Camera::start(ShutterMode::Manual, || {});
+    let cam = Camera::start(
+        Config {
+            source: Source::PureThermal,
+            shutter_mode: ShutterMode::Manual,
+            gain: Default::default(),
+        },
+        || {},
+    );
 
     // Measure from the first frame so that stream start-up does not count against the rate.
     let wait = Instant::now();

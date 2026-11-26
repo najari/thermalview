@@ -11,7 +11,7 @@ winit = { path = "crates/winit" }
 name = "thermalview"
 version = "0.1.0"
 edition = "2021"
-description = "Thermal viewer and measurement tool for PureThermal + FLIR Lepton 3.5"
+description = "Thermal viewer and measurement tool for PureThermal + FLIR Lepton 3.5 and Thermal Master P3"
 publish = false
 
 [dependencies]
@@ -33,6 +33,7 @@ windows = { version = "0.62", features = [
     "Win32_Media_MediaFoundation",
     "Win32_System_Com",
 ] }
+rusb = { version = "0.9", default-features = false }
 
 [profile.release]
 debug = "line-tables-only"
