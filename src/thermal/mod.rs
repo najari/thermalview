@@ -8,6 +8,7 @@ pub mod history;
 pub mod measure;
 pub mod palette;
 pub mod range;
+pub mod rotate;
 pub mod shapes;
 pub mod upscale;
 

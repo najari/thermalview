@@ -173,6 +173,11 @@ pub(super) fn execute(app: &mut ThermalApp, status: &CameraStatus, req: Request)
             app.render();
             Ok(range_line(app))
         }
+        Request::Rotate(None) => Ok(proto::rotation_degrees(app.settings.rotation).to_string()),
+        Request::Rotate(Some(r)) => {
+            app.set_rotation(r).map_err(|why| why.to_string())?;
+            Ok(proto::rotation_degrees(r).to_string())
+        }
         Request::Emissivity(None) => Ok(format!("{:.3}", app.settings.calibration.emissivity)),
         Request::Emissivity(Some(e)) => {
             if app.csv.is_some() {
@@ -449,6 +454,26 @@ mod tests {
     }
 
     #[test]
+    fn rotation_turns_the_image_and_moves_the_spots() {
+        let mut app = rig();
+        run(&mut app, "SPOT ADD 100 40").unwrap();
+        assert_eq!(run(&mut app, "ROTATE").unwrap(), "0");
+        assert_eq!(run(&mut app, "ROTATE 90").unwrap(), "90");
+        let f = app.frame.as_ref().unwrap();
+        assert_eq!((f.width, f.height), (120, 160));
+        // Clockwise: (x, y) of a 160 × 120 image → (119 − y, x).
+        let s = app.settings.spots.items[0];
+        assert_eq!((s.x, s.y), (79, 100));
+        assert_eq!(f.at(79, 100), 31000, "the hot pixel moved with the spot");
+        assert!(run(&mut app, "FRAME").unwrap().starts_with("w=120 h=160 "));
+        // Back to upright by another 270°: everything returns.
+        assert_eq!(run(&mut app, "ROTATE 0").unwrap(), "0");
+        let s = app.settings.spots.items[0];
+        assert_eq!((s.x, s.y), (100, 40));
+        assert_eq!(app.frame.as_ref().unwrap().width, 160);
+    }
+
+    #[test]
     fn frame_is_raw_counts_in_base64() {
         let mut app = rig();
         let r = run(&mut app, "FRAME").unwrap();
@@ -471,8 +496,9 @@ mod tests {
         let csv = run(&mut app, "CSV START").unwrap();
         assert!(run(&mut app, "CSV START").is_err());
         assert!(run(&mut app, "STATUS").unwrap().contains(" csv=on "));
-        // Calibration is frozen while a CSV runs, as in the window.
+        // Calibration and rotation are frozen while a CSV runs, as in the window.
         assert!(run(&mut app, "EMISSIVITY 0.9").is_err());
+        assert!(run(&mut app, "ROTATE 90").is_err());
         app.record(0.0);
         let done = run(&mut app, "CSV STOP").unwrap();
         assert_eq!(done, format!("rows=1 {csv}"));

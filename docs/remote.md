@@ -38,6 +38,7 @@
 | `PALETTE [이름]` | `OK ironbow` | 팔레트 읽기·바꾸기: `ironbow`, `rainbow`, `whitehot`, `blackhot`, `lava` |
 | `RANGE` | `OK auto 29.54 42.51` | 눈금 방식과 지금 쓰는 범위 |
 | `RANGE AUTO` / `RANGE lo hi` | `OK manual 20.00 40.00` | 자동 범위 / 수동 범위 |
+| `ROTATE [도]` | `OK 90` | 실시간 영상 회전 읽기·바꾸기(시계 방향 0, 90, 180, 270). 측정점·영역도 같은 장면 위치로 옮겨짐. 재생 중과 CSV·녹화·MP4 기록 중에는 바꿀 수 없음 |
 | `EMISSIVITY [e]` | `OK 0.950` | 방사율 읽기·바꾸기(0.10~1.00). CSV 기록 중에는 바꿀 수 없음 |
 | `ALARMS` | `OK enabled=on monitoring=on R1=active R2=clear` | 경보 감시 상태(`on`, `playback`, `nosignal`, `counts`)와 규칙별 상태(`active`, `pending`, `clear`, `off`) |
 | `SNAPSHOT` | `OK C:\...\thermal_20261125_100417_368.png` | 스냅샷 저장(컬러 PNG, 16비트 PNG, JSON). 컬러 PNG 경로를 돌려줌 |

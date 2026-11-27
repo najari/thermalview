@@ -5,13 +5,13 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::camera::lepton::ShutterMode;
-use crate::camera::p3::Gain;
 use crate::camera::Source;
 use crate::thermal::alarm::AlarmConfig;
 use crate::thermal::calibration::Calibration;
 use crate::thermal::measure::Spots;
 use crate::thermal::palette::Palette;
 use crate::thermal::range::RangeMode;
+use crate::thermal::rotate::Rotation;
 use crate::thermal::shapes::Shapes;
 use crate::thermal::upscale::UpscaleSettings;
 use crate::webcam::blend::Overlay;
@@ -21,8 +21,6 @@ use crate::webcam::blend::Overlay;
 pub struct Settings {
     /// Which camera to look for.
     pub camera: Source,
-    /// Thermal Master P3 measurement range.
-    pub p3_gain: Gain,
     /// Shutter-less module: MANUAL by default so the camera never runs FFC on an open lens.
     pub shutter_mode: ShutterMode,
     pub palette: Palette,
@@ -34,6 +32,8 @@ pub struct Settings {
     /// Emissivity, reflected temperature and reference correction.
     pub calibration: Calibration,
     pub show_extremes: bool,
+    /// Clockwise turn applied to live frames.
+    pub rotation: Rotation,
     /// 4× display upscaling (view, MP4, extra snapshot image).
     pub upscale: UpscaleSettings,
     pub snapshot_dir: Option<PathBuf>,
@@ -76,7 +76,6 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             camera: Source::default(),
-            p3_gain: Gain::default(),
             shutter_mode: ShutterMode::Manual,
             palette: Palette::default(),
             range: RangeMode::default(),
@@ -85,6 +84,7 @@ impl Default for Settings {
             alarms: AlarmConfig::default(),
             calibration: Calibration::default(),
             show_extremes: true,
+            rotation: Rotation::default(),
             upscale: UpscaleSettings::default(),
             snapshot_dir: None,
             remote: RemoteSettings::default(),

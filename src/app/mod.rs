@@ -10,12 +10,12 @@ mod view;
 mod webcam;
 
 use std::path::PathBuf;
+use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime};
 
 use eframe::egui;
 
 use crate::camera::lepton::ShutterMode;
-use crate::camera::p3::Gain;
 use crate::camera::{Camera, CameraStatus, Command, ConnState, Kind, Source};
 use crate::settings::Settings;
 use crate::storage::csv_log::{self, CsvLog};
@@ -25,6 +25,7 @@ use crate::thermal::frame::{FrameStats, ThermalFrame};
 use crate::thermal::history::{History, Sample};
 use crate::thermal::palette::{self, Palette};
 use crate::thermal::range::{AutoRange, RangeMode};
+use crate::thermal::rotate::Rotation;
 use crate::thermal::shapes::{Grab, Shape, ShapeKind};
 use crate::thermal::upscale::{self, Sharpen, Upscaler};
 use crate::video::Mp4Writer;
@@ -81,6 +82,10 @@ pub struct ThermalApp {
     /// The 4× upscaled image of the current frame (empty when upscaling is off).
     rgba_up: Vec<u8>,
     upscaler: Option<Upscaler>,
+    /// Installed Upscayl, for AI copies of snapshots.
+    upscayl: Option<crate::upscayl::Upscayl>,
+    /// Running AI upscales: each reports the written file or an error.
+    ai_jobs: Vec<mpsc::Receiver<Result<PathBuf, String>>>,
     lut: (Palette, [[u8; 3]; 256]),
     auto_range: AutoRange,
     /// Range used for the current image, in display units.
@@ -120,7 +125,6 @@ impl ThermalApp {
         let config = crate::camera::Config {
             source: settings.camera,
             shutter_mode: settings.shutter_mode,
-            gain: settings.p3_gain,
         };
         let camera = Camera::start(config, move || ctx.request_repaint());
         Self::with_camera(settings, camera)
@@ -139,6 +143,8 @@ impl ThermalApp {
             texture_dirty: false,
             rgba_up: Vec::new(),
             upscaler: None,
+            upscayl: crate::upscayl::find(),
+            ai_jobs: Vec::new(),
             lut,
             auto_range: AutoRange::default(),
             display_range: (20.0, 40.0),
@@ -440,7 +446,7 @@ impl ThermalApp {
                 }
             }
         } else {
-            let f = self.camera.take_frame()?;
+            let f = self.settings.rotation.apply(self.camera.take_frame()?);
             if let Some(w) = &mut self.seq {
                 w.push(&f);
             }
@@ -529,6 +535,21 @@ impl ThermalApp {
         let n = upscale::FACTOR;
         let upscaled = (self.rgba_up.len() == f.width * f.height * 4 * n * n)
             .then_some(self.rgba_up.as_slice());
+        let ai = self
+            .upscayl
+            .clone()
+            .filter(|_| self.settings.upscale.ai)
+            .map(|u| {
+                let input = crate::upscayl::Input {
+                    raw: f.raw.clone(),
+                    width: f.width,
+                    height: f.height,
+                    lo: f.raw_from_value(self.display_range.0),
+                    hi: f.raw_from_value(self.display_range.1),
+                    lut: self.lut.1,
+                };
+                (u, input)
+            });
         let meta = SnapshotMeta {
             app: "thermalview",
             version: env!("CARGO_PKG_VERSION"),
@@ -588,12 +609,16 @@ impl ThermalApp {
                 overlay: *overlay,
             }),
             upscale: upscaled.is_some().then_some(self.settings.upscale),
+            ai_model: ai.as_ref().map(|(u, _)| u.model.clone()),
         };
         let dir = self.settings.snapshot_dir();
         let picture = cam.as_ref().map(|(pic, _)| pic.as_ref());
         match snapshot::save(&dir, f, &self.rgba, upscaled, picture, &meta) {
             Ok(files) => {
                 self.notify(format!("저장됨: {}", files.color_png.display()));
+                if let Some((u, input)) = ai {
+                    self.start_ai_upscale(u, input, files.color_png.clone());
+                }
                 Ok(files.color_png)
             }
             Err(e) => {
@@ -740,6 +765,22 @@ impl ThermalApp {
             changed |= ui
                 .checkbox(&mut self.settings.show_extremes, "최고·최저 위치 표시")
                 .changed();
+            let can_rotate = self.rotation_lock().is_none();
+            let mut rot = self.settings.rotation;
+            ui.add_enabled_ui(can_rotate, |ui| {
+                egui::ComboBox::from_label("영상 회전")
+                    .selected_text(rot.label())
+                    .show_ui(ui, |ui| {
+                        for r in Rotation::ALL {
+                            ui.selectable_value(&mut rot, r, r.label());
+                        }
+                    })
+                    .response
+                    .on_disabled_hover_text(self.rotation_lock().map_or("", |l| l.0));
+            });
+            if rot != self.settings.rotation {
+                let _ = self.set_rotation(rot);
+            }
             changed |= ui
                 .checkbox(&mut self.settings.upscale.enabled, "4배 업스케일")
                 .on_hover_text(
@@ -760,6 +801,30 @@ impl ThermalApp {
                     .on_hover_text("강하게는 미세한 부분이 또렷해지지만 센서 잡음도 함께 커집니다");
                 changed |= s != self.settings.upscale.sharpen;
                 self.settings.upscale.sharpen = s;
+            }
+            match &self.upscayl {
+                Some(u) => {
+                    let hint = format!(
+                        "스냅샷마다 Upscayl({})로 4배 확대한 _ai_x4.png를 추가로 만듭니다. 1~2초 걸립니다.",
+                        u.model
+                    );
+                    if ui
+                        .checkbox(&mut self.settings.upscale.ai, "스냅샷에 AI 업스케일 추가")
+                        .on_hover_text(hint)
+                        .changed()
+                    {
+                        self.mark_dirty();
+                    }
+                }
+                None => {
+                    ui.add_enabled(
+                        false,
+                        egui::Checkbox::new(&mut false, "스냅샷에 AI 업스케일 추가"),
+                    )
+                    .on_disabled_hover_text(
+                        "Upscayl이 설치돼 있지 않습니다. 설치(winget install Upscayl.Upscayl) 후 앱을 다시 시작하세요.",
+                    );
+                }
             }
             if changed {
                 self.mark_dirty();
@@ -866,6 +931,95 @@ impl ThermalApp {
         });
     }
 
+    /// Why the rotation cannot change now: a recording keeps one image size and fixed
+    /// measurement positions, and played-back frames were already turned when recorded.
+    /// Make the AI-upscaled copy of a saved snapshot on a helper thread (it takes a second or
+    /// two); [`Self::poll_ai_jobs`] reports the result.
+    fn start_ai_upscale(
+        &mut self,
+        u: crate::upscayl::Upscayl,
+        input: crate::upscayl::Input,
+        color_png: PathBuf,
+    ) {
+        let (tx, rx) = mpsc::channel();
+        let spawned = std::thread::Builder::new()
+            .name("upscayl".into())
+            .spawn(move || {
+                let out = crate::upscayl::output_for(&color_png);
+                let r = crate::upscayl::make(&u, &input, &out).map(|_| out);
+                let _ = tx.send(r.map_err(|e| format!("{e:#}")));
+            });
+        match spawned {
+            Ok(_) => {
+                self.ai_jobs.push(rx);
+                self.notify("AI 업스케일 중…");
+            }
+            Err(e) => self.notify(format!("AI 업스케일을 시작할 수 없습니다: {e}")),
+        }
+    }
+
+    fn poll_ai_jobs(&mut self) {
+        let mut done = Vec::new();
+        self.ai_jobs.retain(|rx| match rx.try_recv() {
+            Ok(r) => {
+                done.push(r);
+                false
+            }
+            Err(mpsc::TryRecvError::Empty) => true,
+            Err(mpsc::TryRecvError::Disconnected) => false,
+        });
+        for r in done {
+            self.notify(match r {
+                Ok(p) => format!("AI 업스케일 저장됨: {}", p.display()),
+                Err(e) => format!("AI 업스케일 실패: {e}"),
+            });
+        }
+    }
+
+    /// Returns (message for the window, message for remote clients).
+    fn rotation_lock(&self) -> Option<(&'static str, &'static str)> {
+        if self.player.is_some() {
+            Some((
+                "재생 중에는 바꿀 수 없습니다(녹화할 때의 방향으로 저장돼 있음)",
+                "a recording is being played back; rotation applies to live video",
+            ))
+        } else if self.csv.is_some() || self.seq.is_some() || self.video.is_some() {
+            Some((
+                "CSV·녹화·MP4 기록 중에는 바꿀 수 없습니다",
+                "rotation cannot change while CSV, REC or MP4 runs",
+            ))
+        } else {
+            None
+        }
+    }
+
+    /// Turn the live image. The current frame and every Spot, Box and Line move with it, so
+    /// measurements stay on the same scene points.
+    pub(super) fn set_rotation(&mut self, new: Rotation) -> Result<(), &'static str> {
+        if let Some((_, why)) = self.rotation_lock() {
+            return Err(why);
+        }
+        let step = new.since(self.settings.rotation);
+        if let Some(f) = self.frame.take() {
+            let size = (f.width, f.height);
+            for s in &mut self.settings.spots.items {
+                (s.x, s.y) = step.point((s.x, s.y), size);
+            }
+            for s in &mut self.settings.shapes.items {
+                s.a = step.point(s.a, size);
+                s.b = step.point(s.b, size);
+            }
+            let f = step.apply(f);
+            self.stats = Some(f.stats());
+            self.frame = Some(f);
+        }
+        self.drag = None;
+        self.settings.rotation = new;
+        self.mark_dirty();
+        self.render();
+        Ok(())
+    }
+
     /// Shutter mode and FFC of the shutterless Lepton.
     fn lepton_controls(&mut self, ui: &mut egui::Ui, status: &CameraStatus) {
         ui.heading("Lepton 보정(FFC)");
@@ -910,22 +1064,11 @@ impl ThermalApp {
         }
     }
 
-    /// Measurement range and shutter of the Thermal Master P3.
+    /// Shutter of the Thermal Master P3. Its gain (range) is left to the camera: switching it
+    /// disturbs the stream and the low-gain readings are not understood (DEVELOPMENT.md, stage 9).
     fn p3_controls(&mut self, ui: &mut egui::Ui, status: &CameraStatus) {
         ui.heading("P3 설정");
-        let mut gain = self.settings.p3_gain;
-        egui::ComboBox::from_label("측정 범위")
-            .selected_text(gain.label())
-            .show_ui(ui, |ui| {
-                for g in [Gain::High, Gain::Low] {
-                    ui.selectable_value(&mut gain, g, g.label());
-                }
-            });
-        if gain != self.settings.p3_gain {
-            self.settings.p3_gain = gain;
-            self.camera.send(Command::SetGain(gain));
-            self.mark_dirty();
-        }
+        ui.label("측정 범위는 카메라 기본값(고감도, 약 −20~150 °C)을 씁니다.");
         // The P3 has a real shutter: no need to cover the lens (unlike the Lepton, rule 4).
         let streaming = status.state == ConnState::Streaming;
         if ui
@@ -988,6 +1131,7 @@ impl ThermalApp {
         remote::sync(self, ctx);
         remote::process(self, &status);
         webcam::sync(self, ctx);
+        self.poll_ai_jobs();
         self.save_settings_if_due(false);
         // Keep status fresh even when no frames arrive (disconnected / stalled).
         ctx.request_repaint_after(Duration::from_millis(500));
@@ -1254,6 +1398,34 @@ mod tests {
         assert_eq!(x4.len(), 1);
         let img = image::open(&x4[0]).unwrap();
         assert_eq!((img.width(), img.height()), (1024, 768));
+
+        // AI copy through a stand-in Upscayl that copies its input.
+        app.upscayl = Some(crate::upscayl::tests::fake(&dir.join("upscayl"), true));
+        app.settings.upscale.ai = true;
+        let png = app.take_snapshot(&CameraStatus::default()).unwrap();
+        let ai = crate::upscayl::output_for(&png);
+        let t = Instant::now();
+        while app.ai_jobs.len() == 1 && t.elapsed() < Duration::from_secs(10) {
+            app.poll_ai_jobs();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(app.ai_jobs.is_empty());
+        // The stand-in copies its input, the sharpened sensor image; the temporary file is gone.
+        let copied = image::open(&ai).unwrap();
+        assert_eq!((copied.width(), copied.height()), (256, 192));
+        let leftovers = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .path()
+                    .to_string_lossy()
+                    .ends_with("_in.png")
+            })
+            .count();
+        assert_eq!(leftovers, 0);
+        let json = std::fs::read_to_string(png.with_extension("json")).unwrap();
+        assert!(json.contains("\"ai_model\": \"upscayl-lite-4x\""), "{json}");
 
         app.settings.upscale.enabled = false;
         app.render();

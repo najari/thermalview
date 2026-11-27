@@ -25,14 +25,15 @@ const ROWS: usize = 2 * HEIGHT + 2;
 const THERMAL_ROW: usize = HEIGHT + 2;
 /// Start marker + pixels: everything before the end marker.
 const BODY: usize = MARKER + 2 * ROWS * WIDTH;
-
 /// Bulk read size. Reading a whole frame at once is reported to wedge the device on Windows.
 pub const CHUNK: usize = 16 * 1024;
 const EP_IN: u8 = 0x81;
 const CTRL_TIMEOUT: Duration = Duration::from_secs(1);
 const READ_TIMEOUT: Duration = Duration::from_millis(500);
 
-/// Measurement range of the sensor.
+/// Measurement range of the sensor. Not used by the app: switching disturbs the stream for
+/// seconds, and low-gain pixels are not in 1/64 K (a room read about −33 °C). For experiments
+/// (`examples/p3`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum Gain {
     /// −20 to 150 °C, more sensitive.
@@ -113,8 +114,14 @@ fn counter(marker: &[u8]) -> u32 {
 #[derive(Default)]
 pub struct Assembler {
     buf: Vec<u8>,
-    /// Frames thrown away: wrong size, counter mismatch, or no end marker.
+    /// Frames thrown away, all reasons.
     pub dropped: u64,
+    /// Of those: ended at the wrong size, markers from different frames, ran past a frame.
+    pub wrong_size: u64,
+    pub mismatch: u64,
+    pub too_long: u64,
+    /// Reads ignored while waiting for a start marker.
+    pub skipped: u64,
 }
 
 impl Assembler {
@@ -129,17 +136,27 @@ impl Assembler {
             });
             if !ok && !self.buf.is_empty() {
                 self.dropped += 1;
+                if self.buf.len() != BODY {
+                    self.wrong_size += 1;
+                } else {
+                    self.mismatch += 1;
+                }
             }
             self.buf.clear();
             return frame;
         }
         if self.buf.is_empty() && !is_start(chunk) {
+            if !chunk.is_empty() {
+                self.skipped += 1;
+            }
             return None; // out of step: wait for a start marker
         }
+        // Longer than a frame: the camera's other transfer layout (during warm-up and shutter
+        // cycles it sends 204,800-byte transfers without end markers), dropped.
         if self.buf.len() + chunk.len() > BODY {
-            // Too long, e.g. the odd frame the camera sends right after a shutter cycle.
             self.buf.clear();
             self.dropped += 1;
+            self.too_long += 1;
             return None;
         }
         self.buf.extend_from_slice(chunk);
@@ -243,12 +260,19 @@ impl Device {
     /// The start sequence. `wait` sleeps and returns false if the caller wants to stop, in which
     /// case this returns Ok(false).
     pub fn start(&mut self, wait: &mut dyn FnMut(Duration) -> bool) -> rusb::Result<bool> {
-        self.query(&start_stream(), 1)?;
+        // 0x01: started; 0x35: the camera was still streaming.
+        let r = self.query(&start_stream(), 1)?;
+        log::debug!("P3 start_stream (first) -> {r:02x?}");
         if !wait(Duration::from_secs(1)) {
             return Ok(false);
         }
         self.h.set_alternate_setting(1, 1)?;
         self.streaming = true;
+        // A session that ended mid-transfer can leave the endpoint's data toggle out of step,
+        // after which every packet is silently discarded. Clearing the halt resets it.
+        if let Err(e) = self.h.clear_halt(EP_IN) {
+            log::warn!("P3: clearing the stream endpoint failed: {e}");
+        }
         self.h.write_control(0x40, 0xEE, 0, 1, &[], CTRL_TIMEOUT)?;
         if !wait(Duration::from_secs(2)) {
             return Ok(false);
@@ -258,7 +282,8 @@ impl Device {
         let _ = self
             .h
             .read_bulk(EP_IN, &mut buf, Duration::from_millis(100));
-        self.query(&start_stream(), 1)?;
+        let r = self.query(&start_stream(), 1)?;
+        log::debug!("P3 start_stream (final) -> {r:02x?}");
         Ok(true)
     }
 
@@ -272,6 +297,29 @@ impl Device {
 
     pub fn set_gain(&self, g: Gain) -> rusb::Result<()> {
         self.send(&set_gain(g))
+    }
+
+    /// The camera's internal log lines, read from the long form of the status register.
+    pub fn debug_log(&self) -> rusb::Result<String> {
+        let mut b = [0u8; 128];
+        let n = self
+            .h
+            .read_control(0xC1, 0x22, 0, 0, &mut b, CTRL_TIMEOUT)?;
+        let text: String = b[..n]
+            .iter()
+            .skip(1)
+            .map(|&c| match c {
+                32..=126 => c as char,
+                _ => ' ',
+            })
+            .collect();
+        Ok(text.split_whitespace().collect::<Vec<_>>().join(" "))
+    }
+
+    /// USB reset of the device. Interfaces must be claimed again afterwards (use [`open`]).
+    pub fn reset(mut self) -> rusb::Result<()> {
+        self.streaming = false;
+        self.h.reset()
     }
 
     /// Close the shutter and recalibrate (the camera also does this by itself every ~90 s).
@@ -380,9 +428,9 @@ mod tests {
         assert!(feed(&mut a, &bad).is_empty());
         assert_eq!(a.dropped, 1);
 
-        // A frame with extra data (as after a shutter cycle).
+        // A frame with more data than any known layout.
         let mut long = frame_reads(3, 100);
-        long.insert(1, vec![0; 2048]);
+        long.insert(1, vec![0; 10_000]);
         assert!(feed(&mut a, &long).is_empty());
         assert_eq!(a.dropped, 2);
 
@@ -393,6 +441,8 @@ mod tests {
         assert_eq!(a.dropped, 3);
 
         assert_eq!(feed(&mut a, &frame_reads(5, 200)).len(), 1);
+        assert_eq!((a.mismatch, a.too_long, a.wrong_size), (1, 1, 1));
+        assert!(a.skipped > 0, "the reads of the partial frame");
     }
 
     #[test]

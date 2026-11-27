@@ -57,6 +57,8 @@ pub struct SnapshotMeta {
     pub webcam: Option<WebcamInfo>,
     /// Display upscaling in use; the upscaled color image is saved as `_x4.png`.
     pub upscale: Option<UpscaleSettings>,
+    /// Upscayl model making `_ai_x4.png` after the snapshot (written a moment later).
+    pub ai_model: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -155,6 +157,7 @@ mod tests {
             calibration: None,
             webcam: None,
             upscale: None,
+            ai_model: None,
         };
         let up = vec![200u8; 16 * 12 * 4];
         let files = save(&dir, &frame, &rgba, Some(&up), None, &meta).unwrap();

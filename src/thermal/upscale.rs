@@ -55,6 +55,8 @@ impl Sharpen {
 pub struct UpscaleSettings {
     pub enabled: bool,
     pub sharpen: Sharpen,
+    /// Also make an AI-upscaled copy of each snapshot with Upscayl, when it is installed.
+    pub ai: bool,
 }
 
 /// Spatial Wiener filter for a Gaussian PSF: G = H / (H² + K), H the PSF's transfer function
@@ -159,8 +161,9 @@ impl Upscaler {
         self.sharpen
     }
 
-    /// The deconvolved image (a copy when sharpening is off).
-    fn deconvolve(&self, src: &[u16], w: usize, h: usize) -> Vec<f32> {
+    /// The deconvolved image at sensor size (a copy when sharpening is off). Used as the input
+    /// of the AI upscaler, as thermal-upscale does.
+    pub fn deconvolve(&self, src: &[u16], w: usize, h: usize) -> Vec<f32> {
         if self.kernel.is_empty() {
             return src.iter().map(|&v| v as f32).collect();
         }

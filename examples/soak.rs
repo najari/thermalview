@@ -17,7 +17,6 @@ fn main() {
         Config {
             source: Source::PureThermal,
             shutter_mode: ShutterMode::Manual,
-            gain: Default::default(),
         },
         || {},
     );

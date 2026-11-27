@@ -7,6 +7,7 @@
 pub mod server;
 
 use crate::thermal::palette::Palette;
+use crate::thermal::rotate::Rotation;
 
 /// Longest accepted command line, in bytes (without the line ending).
 pub const MAX_LINE: usize = 256;
@@ -38,6 +39,8 @@ pub enum Request {
     SpotClear,
     Palette(Option<Palette>),
     Range(Option<RangeSet>),
+    /// Clockwise turn of the live image.
+    Rotate(Option<Rotation>),
     Emissivity(Option<f32>),
     Alarms,
     Snapshot,
@@ -52,7 +55,7 @@ pub enum Request {
 }
 
 pub const HELP: &str = "commands: STATUS | MEAS | TEMP x y | SPOT [LIST|ADD x y|DEL id|CLEAR] | \
-PALETTE [name] | RANGE [AUTO|lo hi] | EMISSIVITY [e] | ALARMS | SNAPSHOT | CSV START|STOP | \
+PALETTE [name] | RANGE [AUTO|lo hi] | ROTATE [0|90|180|270] | EMISSIVITY [e] | ALARMS | SNAPSHOT | CSV START|STOP | \
 REC START|STOP | MP4 START|STOP | FRAME | QUIT";
 
 /// Parse one command line (case-insensitive, words separated by spaces).
@@ -88,6 +91,8 @@ pub fn parse(line: &str) -> Result<Request, String> {
             }
             Request::Range(Some(RangeSet::Manual { lo, hi }))
         }
+        ["ROTATE"] => Request::Rotate(None),
+        ["ROTATE", deg] => Request::Rotate(Some(rotation(deg)?)),
         ["EMISSIVITY"] => Request::Emissivity(None),
         ["EMISSIVITY", e] => Request::Emissivity(Some(number(e)?)),
         ["ALARMS"] => Request::Alarms,
@@ -110,6 +115,7 @@ pub fn parse(line: &str) -> Result<Request, String> {
                 "SPOT",
                 "PALETTE",
                 "RANGE",
+                "ROTATE",
                 "EMISSIVITY",
                 "ALARMS",
                 "SNAPSHOT",
@@ -127,6 +133,23 @@ pub fn parse(line: &str) -> Result<Request, String> {
         }
     };
     Ok(req)
+}
+
+/// Degrees clockwise as the remote protocol writes them.
+pub fn rotation_degrees(r: Rotation) -> u16 {
+    match r {
+        Rotation::R0 => 0,
+        Rotation::R90 => 90,
+        Rotation::R180 => 180,
+        Rotation::R270 => 270,
+    }
+}
+
+fn rotation(s: &str) -> Result<Rotation, String> {
+    Rotation::ALL
+        .into_iter()
+        .find(|r| s.parse() == Ok(rotation_degrees(*r)))
+        .ok_or_else(|| format!("rotation {s}: use 0, 90, 180 or 270"))
 }
 
 fn pixel(s: &str) -> Result<usize, String> {
@@ -237,6 +260,12 @@ mod tests {
         assert!(parse("RANGE 30 20").is_err());
         assert!(parse("RANGE nan 20").is_err());
         assert!(parse("PALETTE purple").unwrap_err().contains("ironbow"));
+        assert_eq!(
+            parse("rotate 270"),
+            Ok(Request::Rotate(Some(Rotation::R270)))
+        );
+        assert_eq!(parse("ROTATE"), Ok(Request::Rotate(None)));
+        assert!(parse("ROTATE 45").unwrap_err().contains("270"));
         assert!(parse("FFC").unwrap_err().starts_with("unknown command"));
         assert!(parse("CSV").unwrap_err().starts_with("bad arguments"));
     }

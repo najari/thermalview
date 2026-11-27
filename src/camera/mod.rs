@@ -69,7 +69,6 @@ impl Source {
 pub struct Config {
     pub source: Source,
     pub shutter_mode: lepton::ShutterMode,
-    pub gain: p3::Gain,
 }
 
 #[cfg(test)]

@@ -20,6 +20,9 @@ use crate::thermal::frame::{decode_le_u16, ThermalFrame};
 
 /// No frame for this long → the stream is considered stalled.
 const STALL_TIMEOUT: Duration = Duration::from_secs(2);
+/// The P3 sends no usable frame for up to ~1.7 s during its shutter cycles (often while warming
+/// up). Reopening it then only makes things worse, so it gets more time.
+const P3_STALL_TIMEOUT: Duration = Duration::from_secs(5);
 /// Limit for the first frame after a stream start (the Lepton may still be booting).
 const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(8);
 /// Lepton status poll + shutter-mode re-apply (2 CCI commands; see the session loop).
@@ -101,8 +104,6 @@ pub enum Command {
     /// lens is covered; the P3 closes its own shutter.
     RunFfc,
     SetShutterMode(ShutterMode),
-    /// P3 measurement range.
-    SetGain(p3::Gain),
 }
 
 /// Frames kept for the UI thread (about 1.8 s of Lepton video). eframe runs a hidden window only
@@ -315,7 +316,6 @@ fn worker(shared: Arc<Shared>, rx: Receiver<Command>, mut config: Config) {
 fn remember(config: &mut Config, cmd: Command) {
     match cmd {
         Command::SetShutterMode(m) => config.shutter_mode = m,
-        Command::SetGain(g) => config.gain = g,
         Command::RunFfc => {}
     }
 }
@@ -414,18 +414,20 @@ fn enforce_mode(h: &Handle, desired: ShutterMode) -> lepton::Result<bool> {
 
 /// Frame-rate reporting and stall detection shared by both cameras.
 struct Watch {
+    stall: Duration,
     start_frames: u64,
     streaming: bool,
     fps_mark: (Instant, u64),
 }
 
 impl Watch {
-    fn new(shared: &Shared) -> Self {
+    fn new(shared: &Shared, stall: Duration) -> Self {
         shared
             .last_frame_ms
             .store(shared.now_ms(), Ordering::SeqCst);
         let frames = shared.frames.load(Ordering::Relaxed);
         Self {
+            stall,
             start_frames: frames,
             streaming: false,
             fps_mark: (Instant::now(), frames),
@@ -444,7 +446,7 @@ impl Watch {
             });
         }
         let limit = if got_frame {
-            STALL_TIMEOUT
+            self.stall
         } else {
             FIRST_FRAME_TIMEOUT
         };
@@ -517,7 +519,7 @@ fn session(
         s.lepton_sw = sw;
     });
 
-    let mut watch = Watch::new(shared);
+    let mut watch = Watch::new(shared, STALL_TIMEOUT);
     if let Err(e) = start_stream(&mut h, shared, scale) {
         shared.status(|s| s.last_error = Some(format!("스트리밍 시작 실패: {e}")));
         return false;
@@ -538,10 +540,6 @@ fn session(
                 Command::SetShutterMode(m) => {
                     config.shutter_mode = m;
                     lepton::set_shutter_mode(&h, m).map(|_| log::info!("shutter mode -> {m:?}"))
-                }
-                Command::SetGain(_) => {
-                    remember(config, cmd);
-                    Ok(())
                 }
             };
             if let Err(e) = result {
@@ -698,11 +696,9 @@ fn p3_session(
             return false;
         }
     }
-    if let Err(e) = dev.set_gain(config.gain) {
-        log::warn!("P3: setting the gain failed: {e}");
-    }
-
-    let mut watch = Watch::new(shared);
+    // No gain command: switching disturbs the stream for seconds and low-gain pixels are not in
+    // 1/64 K (DEVELOPMENT.md, stage 9). The camera keeps its own setting.
+    let mut watch = Watch::new(shared, P3_STALL_TIMEOUT);
     let mut asm = p3::Assembler::default();
     let mut buf = vec![0u8; p3::CHUNK];
     let mut seq = 0u32;
@@ -710,10 +706,6 @@ fn p3_session(
         while let Ok(cmd) = rx.try_recv() {
             let result = match cmd {
                 Command::RunFfc => dev.shutter().map(|_| log::info!("P3 shutter")),
-                Command::SetGain(g) => {
-                    config.gain = g;
-                    dev.set_gain(g).map(|_| log::info!("P3 gain -> {g:?}"))
-                }
                 Command::SetShutterMode(_) => {
                     remember(config, cmd);
                     Ok(())
@@ -750,7 +742,19 @@ fn p3_session(
             break;
         }
     }
-    log::info!("P3 session ended: {seq} frames, {} dropped", asm.dropped);
+    log::info!(
+        "P3 session ended: {seq} frames, {} dropped (size {}, counter {}, too long {}), {} reads skipped",
+        asm.dropped,
+        asm.wrong_size,
+        asm.mismatch,
+        asm.too_long,
+        asm.skipped
+    );
+    // The camera's own log tells why it stopped sending, if it did.
+    match dev.debug_log() {
+        Ok(l) => log::info!("P3 log: {l}"),
+        Err(e) => log::info!("P3 log unavailable: {e}"),
+    }
     let streamed = watch.streamed(shared) || !shared.wants(Kind::P3);
     drop(dev);
     shared.status(|s| s.fps = 0.0);

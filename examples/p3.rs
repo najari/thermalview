@@ -18,10 +18,27 @@ fn main() -> anyhow::Result<()> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(10);
     let shutter = std::env::args().any(|a| a == "shutter");
+    let reset = std::env::args().any(|a| a == "reset");
+    // "low"/"high": switch the gain halfway instead of a shutter cycle.
+    let gain_mid = std::env::args().find_map(|a| match a.as_str() {
+        "low" => Some(p3::Gain::Low),
+        "high" => Some(p3::Gain::High),
+        _ => None,
+    });
 
     let ctx = rusb::Context::new()?;
     let t = Instant::now();
     let mut dev = p3::open(&ctx).map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    println!(
+        "log      : {}",
+        dev.debug_log().unwrap_or_else(|e| e.to_string())
+    );
+    if reset {
+        dev.reset()?;
+        println!("reset    : done");
+        std::thread::sleep(Duration::from_secs(2));
+        dev = p3::open(&ctx).map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    }
     let info = dev.info()?;
     println!(
         "device   : {} fw {} sn {} (opened in {:?})",
@@ -38,8 +55,15 @@ fn main() -> anyhow::Result<()> {
     })? {
         anyhow::bail!("start interrupted");
     }
-    dev.set_gain(p3::Gain::High)?;
+    if !std::env::args().any(|a| a == "nogain") {
+        dev.set_gain(p3::Gain::High)?;
+    }
     println!("started  : {:?}", t.elapsed());
+    std::thread::sleep(Duration::from_millis(500));
+    println!(
+        "log      : {}",
+        dev.debug_log().unwrap_or_else(|e| e.to_string())
+    );
 
     let mut asm = p3::Assembler::default();
     let mut buf = vec![0u8; p3::CHUNK];
@@ -50,19 +74,70 @@ fn main() -> anyhow::Result<()> {
     let mut reads = 0u64;
     let mut empty = 0u64;
     let mut shutter_sent = false;
+    let mut sizes: Vec<(usize, [u8; 2])> = Vec::new();
+    let mut dump = std::env::args().find_map(|a| a.strip_prefix("dump=").map(str::to_owned));
+    let mut transfer: Vec<u8> = Vec::new();
+    let mut transfer_done = true;
+    // `trace=<file>`: every read's size and first two bytes, one per line.
+    let mut trace = std::env::args()
+        .find_map(|a| a.strip_prefix("trace=").map(str::to_owned))
+        .map(std::fs::File::create)
+        .transpose()?;
+    let mut first_drop: Option<Vec<(usize, [u8; 2])>> = None;
     let t0 = Instant::now();
     while t0.elapsed() < Duration::from_secs(secs) {
-        if shutter && !shutter_sent && t0.elapsed() >= Duration::from_secs(secs / 2) {
-            dev.shutter()?;
+        if (shutter || gain_mid.is_some())
+            && !shutter_sent
+            && t0.elapsed() >= Duration::from_secs(secs / 2)
+        {
+            match gain_mid {
+                Some(g) => dev.set_gain(g)?,
+                None => dev.shutter()?,
+            }
             shutter_sent = true;
-            println!("shutter  : sent at {:.1} s", t0.elapsed().as_secs_f64());
+            println!(
+                "halfway  : {:?} sent at {:.1} s",
+                gain_mid,
+                t0.elapsed().as_secs_f64()
+            );
         }
         let n = dev.read(&mut buf)?;
         reads += 1;
         if n == 0 {
             empty += 1;
         }
-        if let Some(raw) = asm.push(&buf[..n]) {
+        // Read sizes up to and including the first dropped frame, for diagnosing desync.
+        if asm.dropped == 0 || sizes.len() < 60 {
+            if sizes.len() >= 60 {
+                sizes.remove(0);
+            }
+            sizes.push((n, buf.get(..2).map(|b| [b[0], b[1]]).unwrap_or_default()));
+        }
+        // Keep the bytes of the current USB transfer; save the first odd-sized one (dump=<file>).
+        if n > 0 {
+            if transfer_done {
+                transfer.clear();
+            }
+            transfer.extend_from_slice(&buf[..n]);
+            transfer_done = n < p3::CHUNK;
+            if transfer_done && transfer.len() == 204_800 {
+                if let Some(path) = dump.take() {
+                    std::fs::write(&path, &transfer)?;
+                    println!("dumped   : 204,800-byte transfer to {path}");
+                }
+            }
+        }
+        if let Some(f) = trace.as_mut() {
+            use std::io::Write;
+            let b = buf.get(..2).unwrap_or_default();
+            writeln!(f, "{n} {:02x}{:02x}", b[0], b[1])?;
+        }
+        let before = asm.dropped;
+        let got = asm.push(&buf[..n]);
+        if asm.dropped > before && first_drop.is_none() {
+            first_drop = Some(sizes.clone());
+        }
+        if let Some(raw) = got {
             let now = Instant::now();
             if let Some((prev, _)) = &last {
                 worst_gap = worst_gap.max(now - *prev);
@@ -73,6 +148,16 @@ fn main() -> anyhow::Result<()> {
         }
     }
     drop(dev);
+    if let Some(s) = &first_drop {
+        let line: Vec<String> = s
+            .iter()
+            .map(|(n, b)| format!("{n}:{:02x}{:02x}", b[0], b[1]))
+            .collect();
+        println!(
+            "1st drop : reads before it (size:first bytes) {}",
+            line.join(" ")
+        );
+    }
 
     let Some((end, raw)) = last else {
         anyhow::bail!("no frame in {secs} s ({reads} reads, {empty} empty)");
@@ -85,6 +170,10 @@ fn main() -> anyhow::Result<()> {
         worst_gap.as_secs_f64() * 1000.0
     );
     println!("reads    : {reads} ({empty} timed out)");
+    println!(
+        "dropped  : size {}, counter {}, too long {}; {} reads skipped",
+        asm.wrong_size, asm.mismatch, asm.too_long, asm.skipped
+    );
     let (mn, mx) = raw
         .iter()
         .fold((u16::MAX, 0), |(a, b), &v| (a.min(v), b.max(v)));
