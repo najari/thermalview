@@ -3,7 +3,7 @@
 
 use eframe::egui::{self, Color32};
 
-use super::{calibration, ThermalApp};
+use super::{calibration, webcam, ThermalApp};
 use crate::camera::{CameraStatus, ConnState, HEIGHT, WIDTH};
 use crate::remote::server::{Reply, Server};
 use crate::remote::{self as proto, RangeSet, Request};
@@ -218,6 +218,7 @@ pub(super) fn execute(app: &mut ThermalApp, status: &CameraStatus, req: Request)
                 proto::base64(&bytes)
             ))
         }
+        Request::Align => webcam::auto_align_now(app),
     }
 }
 

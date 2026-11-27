@@ -7,6 +7,7 @@ use std::sync::Arc;
 use eframe::egui::{self, Color32};
 
 use super::ThermalApp;
+use crate::webcam::align::{self, Found};
 use crate::webcam::blend::{Alignment, Mode, Overlay};
 use crate::webcam::{self, Device, Picture, State, Webcam};
 
@@ -21,6 +22,10 @@ pub(super) struct WebcamState {
     texture: Option<egui::TextureHandle>,
     /// Picture number and mode the texture holds.
     uploaded: Option<(u64, Mode)>,
+    /// Automatic alignment running on a helper thread.
+    aligning: Option<Receiver<Option<Found>>>,
+    /// Outcome of the last automatic alignment, for the panel.
+    align_note: Option<(bool, String)>,
 }
 
 impl WebcamState {
@@ -42,6 +47,20 @@ pub(super) fn sync(app: &mut ThermalApp, ctx: &egui::Context) {
         if let Some(link) = want {
             let ctx = ctx.clone();
             app.webcam.cam = Some(Webcam::open(&link, move || ctx.request_repaint()));
+        }
+    }
+    if let Some(rx) = &app.webcam.aligning {
+        match rx.try_recv() {
+            Ok(found) => {
+                app.webcam.aligning = None;
+                // The outcome is shown in the panel.
+                let _ = apply_alignment(app, found);
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => {
+                app.webcam.aligning = None;
+                app.webcam.align_note = Some((false, "자동 정렬이 중단되었습니다".into()));
+            }
         }
     }
     if let Some(rx) = &app.webcam.listing {
@@ -80,6 +99,103 @@ fn start_listing(app: &mut ThermalApp, ctx: &egui::Context) {
         Ok(_) => app.webcam.listing = Some(rx),
         Err(e) => app.webcam.list_error = Some(format!("장치 목록을 읽지 못했습니다: {e}")),
     }
+}
+
+/// What the automatic alignment compares: the thermal image as shown (turned, if set) and the
+/// newest webcam picture.
+struct AlignInput {
+    thermal: Vec<f32>,
+    width: usize,
+    height: usize,
+    picture: Arc<Picture>,
+}
+
+impl AlignInput {
+    fn take(app: &ThermalApp) -> Result<Self, String> {
+        let (picture, _) = layer(app).ok_or("웹캠 영상이 없습니다")?;
+        let f = app.frame.as_ref().ok_or("열화상 영상이 없습니다")?;
+        Ok(Self {
+            thermal: f.raw.iter().map(|&v| v as f32).collect(),
+            width: f.width,
+            height: f.height,
+            picture,
+        })
+    }
+
+    fn find(&self) -> Option<Found> {
+        let p = &self.picture;
+        align::find(
+            &self.thermal,
+            self.width,
+            self.height,
+            &p.rgba,
+            p.width,
+            p.height,
+        )
+    }
+}
+
+/// Start the automatic alignment on a helper thread (it takes up to about a second).
+fn start_auto_align(app: &mut ThermalApp, ctx: &egui::Context) {
+    if app.webcam.aligning.is_some() {
+        return;
+    }
+    let input = match AlignInput::take(app) {
+        Ok(i) => i,
+        Err(e) => {
+            app.webcam.align_note = Some((false, e));
+            return;
+        }
+    };
+    let (tx, rx) = mpsc::channel();
+    let ctx = ctx.clone();
+    let spawned = std::thread::Builder::new()
+        .name("webcam-align".into())
+        .spawn(move || {
+            let _ = tx.send(input.find());
+            ctx.request_repaint();
+        });
+    match spawned {
+        Ok(_) => {
+            app.webcam.aligning = Some(rx);
+            app.webcam.align_note = None;
+        }
+        Err(e) => {
+            app.webcam.align_note = Some((false, format!("자동 정렬을 시작하지 못했습니다: {e}")))
+        }
+    }
+}
+
+/// Use a search result if it can be trusted; note the outcome for the panel either way.
+fn apply_alignment(app: &mut ThermalApp, found: Option<Found>) -> Result<Found, String> {
+    let r = match found {
+        Some(f) if f.trusted() => {
+            app.settings.webcam.overlay.align = f.align;
+            app.mark_dirty();
+            Ok(f)
+        }
+        Some(f) => Err(format!(
+            "맞는 곳을 찾지 못해 정렬을 바꾸지 않았습니다(일치도 {:.2}). 두 카메라에 함께 보이는 \
+             물체의 윤곽이 뚜렷한 장면에서 다시 해 보세요.",
+            f.score
+        )),
+        None => Err("영상에 비교할 윤곽이 없어 정렬을 바꾸지 않았습니다.".into()),
+    };
+    app.webcam.align_note = Some(match &r {
+        Ok(f) => (true, format!("맞췄습니다(일치도 {:.2}).", f.score)),
+        Err(e) => (false, e.clone()),
+    });
+    r
+}
+
+/// Remote `ALIGN`: search now, on the calling (UI) thread, and use the result if trusted.
+pub(super) fn auto_align_now(app: &mut ThermalApp) -> Result<String, String> {
+    let found = AlignInput::take(app)?.find();
+    let f = apply_alignment(app, found)?;
+    Ok(format!(
+        "scale={:.3} dx={:.3} dy={:.3} score={:.2}",
+        f.align.scale, f.align.dx, f.align.dy, f.score
+    ))
 }
 
 /// The webcam picture to mix in and how: only over live video, while the camera runs.
@@ -259,15 +375,42 @@ pub(super) fn controls(ui: &mut egui::Ui, app: &mut ThermalApp) {
             .step_by(0.002)
             .custom_formatter(|v, _| percent(v)),
     );
-    if ui.button("정렬 초기화").clicked() {
-        *a = Alignment::default();
+    let mut auto = false;
+    ui.horizontal(|ui| {
+        let busy = app.webcam.aligning.is_some();
+        let can = s.enabled && !busy && app.player.is_none();
+        auto = ui
+            .add_enabled(can, egui::Button::new("자동 정렬"))
+            .on_hover_text(
+                "열화상과 웹캠 영상의 윤곽을 비교해 크기와 위치를 맞춥니다. 두 카메라에 함께 \
+                 보이는 물체(사람, 컵, 창틀 등)가 화면에 있을 때 잘 맞습니다",
+            )
+            .clicked();
+        if busy {
+            ui.spinner();
+            ui.label("찾는 중…");
+        }
+        if ui.button("정렬 초기화").clicked() {
+            *a = Alignment::default();
+        }
+    });
+    if let Some((ok, note)) = &app.webcam.align_note {
+        if *ok {
+            ui.label(note);
+        } else {
+            ui.colored_label(RED, note);
+        }
     }
     ui.label(
-        "두 카메라의 위치가 달라 정렬은 한 거리에서만 정확합니다. 측정은 계속 열화상 기준입니다.",
+        "두 카메라의 위치가 달라 정렬은 한 거리에서만 정확합니다. 거리가 바뀌면 다시 맞추세요. \
+         측정은 계속 열화상 기준입니다.",
     );
 
     if app.settings.webcam != before {
         app.mark_dirty();
+    }
+    if auto {
+        start_auto_align(app, ui.ctx());
     }
     if retry {
         // The next `sync` opens it again.
@@ -333,6 +476,39 @@ mod tests {
         ));
         app.tick(&egui::Context::default());
         app
+    }
+
+    #[test]
+    fn auto_alignment_keeps_the_setting_when_nothing_matches() {
+        let dir = std::env::temp_dir().join(format!("thermalview_align_{}", std::process::id()));
+        let mut app = rig(&dir);
+        let before = Alignment {
+            scale: 1.3,
+            dx: 0.1,
+            dy: 0.0,
+        };
+        app.settings.webcam.overlay.align = before;
+        // Solid thermal frame and solid webcam picture: no outlines to compare.
+        assert!(auto_align_now(&mut app).is_err());
+        assert_eq!(app.settings.webcam.overlay.align, before);
+        assert!(matches!(app.webcam.align_note, Some((false, _))));
+
+        // The button's way: a helper thread, collected by `sync`.
+        let ctx = egui::Context::default();
+        app.webcam.align_note = None;
+        start_auto_align(&mut app, &ctx);
+        let t = std::time::Instant::now();
+        while app.webcam.aligning.is_some() && t.elapsed().as_secs() < 20 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            sync(&mut app, &ctx);
+        }
+        assert!(app.webcam.aligning.is_none());
+        assert!(matches!(app.webcam.align_note, Some((false, _))));
+        assert_eq!(app.settings.webcam.overlay.align, before);
+
+        app.settings.webcam.enabled = false;
+        assert!(auto_align_now(&mut app).is_err(), "no webcam picture");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

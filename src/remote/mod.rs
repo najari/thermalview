@@ -50,13 +50,15 @@ pub enum Request {
     Video(bool),
     /// Raw counts of the current frame, base64 of little-endian u16.
     Frame,
+    /// Line up the webcam picture with the thermal image automatically.
+    Align,
     /// Close the connection (answered by the connection thread).
     Quit,
 }
 
 pub const HELP: &str = "commands: STATUS | MEAS | TEMP x y | SPOT [LIST|ADD x y|DEL id|CLEAR] | \
 PALETTE [name] | RANGE [AUTO|lo hi] | ROTATE [0|90|180|270] | EMISSIVITY [e] | ALARMS | SNAPSHOT | CSV START|STOP | \
-REC START|STOP | MP4 START|STOP | FRAME | QUIT";
+REC START|STOP | MP4 START|STOP | FRAME | ALIGN | QUIT";
 
 /// Parse one command line (case-insensitive, words separated by spaces).
 pub fn parse(line: &str) -> Result<Request, String> {
@@ -104,6 +106,7 @@ pub fn parse(line: &str) -> Result<Request, String> {
         ["MP4", "START"] => Request::Video(true),
         ["MP4", "STOP"] => Request::Video(false),
         ["FRAME"] => Request::Frame,
+        ["ALIGN"] => Request::Align,
         ["QUIT" | "EXIT"] => Request::Quit,
         [] => return Err("empty command".into()),
         [cmd, ..] => {
@@ -123,6 +126,7 @@ pub fn parse(line: &str) -> Result<Request, String> {
                 "REC",
                 "MP4",
                 "FRAME",
+                "ALIGN",
                 "QUIT",
             ];
             return Err(if known.contains(cmd) {

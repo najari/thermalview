@@ -1,6 +1,7 @@
 //! Webcam capture for the overlay. One thread per opened camera keeps the newest picture; the UI
 //! takes it when it draws. See docs/DEVELOPMENT.md, stage 8.
 
+pub mod align;
 pub mod blend;
 mod mf;
 

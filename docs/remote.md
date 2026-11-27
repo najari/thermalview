@@ -46,6 +46,7 @@
 | `REC START` / `REC STOP` | `OK C:\...\thermal_seq_....tvseq` / `OK frames=169 C:\...` | 온도 원본 녹화. 재생 중에는 시작할 수 없음 |
 | `MP4 START` / `MP4 STOP` | `OK C:\...\thermal_video_....mp4` / `OK frames=169 C:\...` | 보이는 영상(팔레트, 측정 표시, 색 막대, 시각)을 MP4로 녹화. 재생 중이면 재생 화면을 녹화. 프레임 없이 멈추면 파일을 만들지 않고 `ERR no frames were recorded; no file written` |
 | `FRAME` | `OK w=160 h=120 seq=174 k=0.01 data=VHZm...` | 현재 프레임의 원시값. `data`는 little-endian u16을 base64로 인코딩한 값(38,400바이트 → 51,200자). 섭씨 = 값 × k − 273.15. TLinear가 꺼져 있으면 `k=none` |
+| `ALIGN` | `OK scale=1.352 dx=-0.027 dy=0.089 score=0.44` | 웹캠 합성의 자동 정렬(설정 패널의 "자동 정렬"과 같음). 믿을 만하면(일치도 0.25 이상) 정렬을 바꾸고, 아니면 바꾸지 않고 `ERR …`. 웹캠 합성이 꺼져 있거나 재생 중이면 `ERR`. 약 0.3~1초 걸리고 그동안 창이 멈춤 |
 | `QUIT` | `OK bye` | 연결 종료 |
 
 프레임이 아직 없으면 측정·저장 명령은 `ERR no frame yet`을 돌려줍니다.

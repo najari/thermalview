@@ -31,15 +31,16 @@ const EP_IN: u8 = 0x81;
 const CTRL_TIMEOUT: Duration = Duration::from_secs(1);
 const READ_TIMEOUT: Duration = Duration::from_millis(500);
 
-/// Measurement range of the sensor. Not used by the app: switching disturbs the stream for
-/// seconds, and low-gain pixels are not in 1/64 K (a room read about −33 °C). For experiments
-/// (`examples/p3`).
+/// Measurement range of the sensor. Not used by the app yet: LOW is specified for 100–600 °C and
+/// reads a room far too cold; whether it reads 1/64 K correctly inside its range is unverified.
+/// For experiments (`examples/p3`, `examples/p3gain`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum Gain {
     /// −20 to 150 °C, more sensitive.
     #[default]
     High,
-    /// 0 to 550 °C.
+    /// 100 to 600 °C, as the official app labels it. Colder parts of the scene read far too
+    /// cold (a room reads about −34 °C).
     Low,
 }
 
@@ -47,7 +48,7 @@ impl Gain {
     pub fn label(self) -> &'static str {
         match self {
             Gain::High => "고감도 (−20~150 °C)",
-            Gain::Low => "저감도 (0~550 °C)",
+            Gain::Low => "저감도 (100~600 °C)",
         }
     }
 }
