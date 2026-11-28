@@ -96,6 +96,9 @@ pub struct SeqWriter {
     tx: Option<Sender<(u64, ThermalFrame)>>,
     thread: Option<JoinHandle<anyhow::Result<u64>>>,
     start: Instant,
+    /// Wall-clock start, and the last frame time given out (frame times always increase).
+    start_wall: SystemTime,
+    last_ms: Option<u64>,
     sent: u64,
     bytes: Arc<AtomicU64>,
 }
@@ -141,6 +144,8 @@ impl SeqWriter {
             tx: Some(tx),
             thread: Some(thread),
             start: Instant::now(),
+            start_wall: SystemTime::now(),
+            last_ms: None,
             sent: 0,
             bytes,
         })
@@ -163,13 +168,28 @@ impl SeqWriter {
         self.start.elapsed().as_secs_f64()
     }
 
-    pub fn push(&mut self, f: &ThermalFrame) {
-        if let Some(tx) = &self.tx {
-            let t_ms = self.start.elapsed().as_millis() as u64;
-            if tx.send((t_ms, f.clone())).is_ok() {
-                self.sent += 1;
-            }
+    /// Queue a frame. False when the writer has stopped (a write error, such as a full disk):
+    /// the caller should [`Self::finish`] to get the error and tell the user, or frames would
+    /// be lost without notice.
+    ///
+    /// The frame time is its arrival time, not the time of this call: frames that waited in
+    /// the queue (hidden window) arrive here in a burst, and equal times would make playback
+    /// skip all but one of them.
+    pub fn push(&mut self, f: &ThermalFrame) -> bool {
+        let Some(tx) = &self.tx else {
+            return false;
+        };
+        let since = f.captured.duration_since(self.start_wall);
+        let mut t_ms = since.unwrap_or_default().as_millis() as u64;
+        if let Some(last) = self.last_ms {
+            t_ms = t_ms.max(last + 1);
         }
+        self.last_ms = Some(t_ms);
+        let sent = tx.send((t_ms, f.clone())).is_ok();
+        if sent {
+            self.sent += 1;
+        }
+        sent
     }
 
     /// Close the file. Returns (path, frames written).
@@ -215,7 +235,9 @@ pub struct SeqReader {
 
 impl SeqReader {
     pub fn open(path: &Path) -> anyhow::Result<Self> {
-        let mut file = BufReader::new(File::open(path)?);
+        // Unbuffered while scanning: the scan reads 16 bytes per record and then jumps past
+        // the frame data, so a buffer would be filled and thrown away for every record.
+        let mut file = File::open(path)?;
         let mut magic = [0u8; 8];
         file.read_exact(&mut magic)?;
         let compressed = match &magic {
@@ -230,13 +252,14 @@ impl SeqReader {
         let mut json = vec![0u8; len];
         file.read_exact(&mut json)?;
         let header: SeqHeader = serde_json::from_slice(&json)?;
+        let pixels = header.width.checked_mul(header.height);
         anyhow::ensure!(
-            header.width > 0 && header.height > 0 && header.width * header.height <= 1 << 22,
+            header.width > 0 && header.height > 0 && pixels.is_some_and(|n| n <= 1 << 22),
             "bad frame size"
         );
 
         // Scan the record headers. A record that does not fit in the file (crash) ends the scan.
-        let total = file.get_ref().metadata()?.len();
+        let total = file.metadata()?.len();
         let raw_len = (header.width * header.height * 2) as u64;
         let head_len: u64 = if compressed { 16 } else { 12 };
         let mut pos = 12 + len as u64;
@@ -264,7 +287,7 @@ impl SeqReader {
         }
         Ok(Self {
             path: path.to_path_buf(),
-            file,
+            file: BufReader::new(file),
             header,
             compressed,
             index,
@@ -317,8 +340,8 @@ impl SeqReader {
     }
 }
 
-/// Sequence files in `dir`, newest first.
-pub fn list(dir: &Path) -> Vec<(PathBuf, u64)> {
+/// Sequence files in `dir`, newest first: (path, bytes, last change).
+pub fn list(dir: &Path) -> Vec<(PathBuf, u64, SystemTime)> {
     let mut v: Vec<(PathBuf, u64, SystemTime)> = std::fs::read_dir(dir)
         .into_iter()
         .flatten()
@@ -330,7 +353,7 @@ pub fn list(dir: &Path) -> Vec<(PathBuf, u64)> {
         })
         .collect();
     v.sort_by_key(|e| std::cmp::Reverse(e.2));
-    v.into_iter().map(|(p, n, _)| (p, n)).collect()
+    v
 }
 
 #[cfg(test)]

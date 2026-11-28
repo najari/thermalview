@@ -80,7 +80,8 @@ impl Source {
         v.is_finite().then_some(v)
     }
 
-    fn exists(self, spots: &Spots, shapes: &Shapes) -> bool {
+    /// False once the Spot, Box or Line it reads has been deleted.
+    pub fn exists(self, spots: &Spots, shapes: &Shapes) -> bool {
         match self {
             Source::Frame(_) | Source::Center => true,
             Source::Spot(id) => spots.items.iter().any(|s| s.id == id),
@@ -148,6 +149,8 @@ pub struct AlarmConfig {
     pub hold_s: f32,
     /// How far back past the threshold the value must return to clear the alarm (°C).
     pub hysteresis: f32,
+    /// Save a snapshot when an alarm is raised.
+    pub snapshot_on_raise: bool,
     next_id: u32,
 }
 
@@ -158,6 +161,7 @@ impl Default for AlarmConfig {
             rules: Vec::new(),
             hold_s: 1.0,
             hysteresis: 0.5,
+            snapshot_on_raise: false,
             next_id: 0,
         }
     }
@@ -203,6 +207,8 @@ impl AlarmConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Suspended {
     Playback,
+    /// The image is held (frozen, or a saved snapshot is open): no new frames to judge.
+    Frozen,
     NoSignal,
     NotRadiometric,
 }
@@ -211,6 +217,7 @@ impl Suspended {
     pub fn label(self) -> &'static str {
         match self {
             Suspended::Playback => "녹화 재생 중",
+            Suspended::Frozen => "화면 정지 중",
             Suspended::NoSignal => "카메라 영상 없음",
             Suspended::NotRadiometric => "온도값이 아닌 원시값 수신 중",
         }

@@ -88,33 +88,61 @@ impl Player {
         Ok(None)
     }
 
+    pub fn is_playing(&self) -> bool {
+        self.playing
+    }
+
+    /// Pause, or play on (from the start when at the end).
+    pub fn toggle_play(&mut self) -> anyhow::Result<()> {
+        if self.playing {
+            self.anchor = (Instant::now(), self.current_ms());
+            self.playing = false;
+        } else {
+            if self.index + 1 >= self.reader.len() {
+                self.seek(0)?;
+            }
+            self.anchor = (Instant::now(), self.anchor.1);
+            self.playing = true;
+        }
+        Ok(())
+    }
+
+    /// Pause and go one frame forward or back.
+    pub fn step(&mut self, forward: bool) -> anyhow::Result<()> {
+        let next = if forward {
+            (self.index + 1 < self.reader.len()).then_some(self.index + 1)
+        } else {
+            self.index.checked_sub(1)
+        };
+        if let Some(i) = next {
+            self.playing = false;
+            self.seek(i)?;
+        }
+        Ok(())
+    }
+
     /// Transport bar. Returns what the app should do.
     pub fn ui(&mut self, ui: &mut egui::Ui) -> anyhow::Result<PlayerAction> {
         let mut action = PlayerAction::None;
         ui.horizontal(|ui| -> anyhow::Result<()> {
             ui.strong(format!("재생: {}", self.file_name()));
-            let label = if self.playing { "⏸" } else { "▶" };
-            if ui.button(label).clicked() {
-                if self.playing {
-                    self.anchor = (Instant::now(), self.current_ms());
-                    self.playing = false;
-                } else {
-                    if self.index + 1 >= self.reader.len() {
-                        self.seek(0)?;
-                    }
-                    self.anchor = (Instant::now(), self.anchor.1);
-                    self.playing = true;
-                }
+            let (label, hint) = if self.playing {
+                ("⏸", "일시정지 (Space)")
+            } else {
+                ("▶", "재생 (Space)")
+            };
+            if ui.button(label).on_hover_text(hint).clicked() {
+                self.toggle_play()?;
             }
-            if ui.button("⏮").on_hover_text("한 프레임 뒤로").clicked() && self.index > 0 {
-                self.playing = false;
-                self.seek(self.index - 1)?;
+            if ui.button("⏮").on_hover_text("한 프레임 뒤로 (←)").clicked() {
+                self.step(false)?;
             }
-            if ui.button("⏭").on_hover_text("한 프레임 앞으로").clicked()
-                && self.index + 1 < self.reader.len()
+            if ui
+                .button("⏭")
+                .on_hover_text("한 프레임 앞으로 (→)")
+                .clicked()
             {
-                self.playing = false;
-                self.seek(self.index + 1)?;
+                self.step(true)?;
             }
             let mut idx = self.index;
             let last = self.reader.len() - 1;
@@ -146,15 +174,16 @@ impl Player {
                 self.anchor = (Instant::now(), self.current_ms());
                 self.speed = speed;
             }
-            if ui.button("실시간으로 돌아가기").clicked() {
+            if ui
+                .button("실시간으로 돌아가기")
+                .on_hover_text("재생을 닫고 카메라 영상으로 돌아갑니다")
+                .clicked()
+            {
                 action = PlayerAction::Close;
             }
             Ok(())
         })
         .inner?;
-        if self.playing {
-            ui.ctx().request_repaint();
-        }
         Ok(action)
     }
 

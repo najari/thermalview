@@ -67,6 +67,8 @@ pub(super) fn update(
 
     let why = if app.player.is_some() {
         Some(Suspended::Playback)
+    } else if app.hold.is_some() {
+        Some(Suspended::Frozen)
     } else if status.state != ConnState::Streaming {
         Some(Suspended::NoSignal)
     } else {
@@ -101,12 +103,14 @@ pub(super) fn update(
         .alarms
         .monitor
         .update(&s.alarms, t, |src| src.read(f, st, &s.spots, &s.shapes));
+    let mut raised = false;
     for c in changes {
         let Some(rule) = s.alarms.rules.iter().find(|r| r.id == c.rule_id) else {
             continue;
         };
         let what = rule.describe(&s.shapes);
         if c.raised {
+            raised = true;
             log::warn!("alarm raised: {what}, value {:.2} C", c.value);
             app.alarms
                 .push(format!("발생: {what} ({:.2} °C)", c.value), Some(RED));
@@ -117,6 +121,13 @@ pub(super) fn update(
             log::info!("alarm cleared: {what}, value {:.2} C", c.value);
             app.alarms
                 .push(format!("해제: {what} ({:.2} °C)", c.value), Some(GREEN));
+        }
+    }
+    // One picture of the frame that raised it, however many rules tripped together.
+    if raised && app.settings.alarms.snapshot_on_raise {
+        if let Ok(path) = app.take_snapshot(status) {
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            app.alarms.push(format!("스냅샷 저장: {name}"), None);
         }
     }
 }
@@ -170,7 +181,9 @@ pub(super) fn banner(ui: &mut egui::Ui, app: &mut ThermalApp) {
     }
 }
 
-fn source_options(spots: &Spots, shapes: &Shapes) -> Vec<Source> {
+/// Everything a rule (or a difference) can read: frame statistics, the center, each Spot and
+/// each statistic of each Box and Line. Never empty.
+pub(super) fn source_options(spots: &Spots, shapes: &Shapes) -> Vec<Source> {
     let mut out: Vec<Source> = Metric::ALL.iter().map(|m| Source::Frame(*m)).collect();
     out.push(Source::Center);
     out.extend(spots.items.iter().map(|s| Source::Spot(s.id)));
@@ -181,8 +194,22 @@ fn source_options(spots: &Spots, shapes: &Shapes) -> Vec<Source> {
 }
 
 /// Rule editor and event log, in the control panel.
+/// One-line state for the header of the panel section.
+pub(super) fn summary(app: &ThermalApp) -> String {
+    let cfg = &app.settings.alarms;
+    let m = &app.alarms.monitor;
+    let active = cfg.rules.iter().filter(|r| m.is_active(r.id)).count();
+    if active > 0 {
+        format!("경보 {active}건")
+    } else if cfg.is_armed() {
+        let armed = cfg.rules.iter().filter(|r| r.enabled).count();
+        format!("감시 중 · 규칙 {armed}")
+    } else {
+        "꺼짐".into()
+    }
+}
+
 pub(super) fn controls(ui: &mut egui::Ui, app: &mut ThermalApp) {
-    ui.heading("온도 경보");
     let suggested = match (&app.frame, &app.stats) {
         (Some(f), Some(st)) if f.is_radiometric() => (f.value(st.max) + 5.0).ceil(),
         _ => 60.0,
@@ -293,6 +320,10 @@ pub(super) fn controls(ui: &mut egui::Ui, app: &mut ThermalApp) {
                     .changed();
                 ui.end_row();
             });
+        changed |= ui
+            .checkbox(&mut cfg.snapshot_on_raise, "경보 발생 시 스냅샷 저장")
+            .on_hover_text("경보가 발생한 순간의 영상을 저장 폴더에 스냅샷으로 남깁니다")
+            .changed();
     }
     egui::CollapsingHeader::new(format!("경보 기록 ({})", app.alarms.log.len()))
         .id_salt("alarm_log")
@@ -375,6 +406,53 @@ mod tests {
             Some(Suspended::NotRadiometric)
         );
         assert!(!app.alarms.monitor.is_active(id));
+    }
+
+    #[test]
+    fn a_held_image_suspends_monitoring() {
+        let (mut app, ctx) = rig(Some(0.01));
+        update(&mut app, &ctx, &streaming(), Some(0.0));
+        assert_eq!(app.alarms.monitor.suspended(), None);
+        app.set_hold(true).unwrap();
+        update(&mut app, &ctx, &streaming(), None);
+        assert_eq!(app.alarms.monitor.suspended(), Some(Suspended::Frozen));
+        assert!(app.alarms.log.back().unwrap().text.contains("화면 정지 중"));
+        app.set_hold(false).unwrap();
+        update(&mut app, &ctx, &streaming(), Some(5.0));
+        assert_eq!(app.alarms.monitor.suspended(), None);
+    }
+
+    #[test]
+    fn a_raised_alarm_can_save_a_snapshot() {
+        let dir = std::env::temp_dir().join(format!("thermalview_alarm_{}", std::process::id()));
+        let (mut app, ctx) = rig(Some(0.01));
+        app.settings.snapshot_dir = Some(dir.clone());
+        // A second rule that trips together with the first: still one picture.
+        app.settings
+            .alarms
+            .add(Source::Center, Condition::Above, 20.0);
+        app.rgba = vec![0; 160 * 120 * 4];
+        let pictures = |dir: &std::path::Path| crate::storage::snapshot::list(dir).len();
+
+        update(&mut app, &ctx, &streaming(), Some(0.0));
+        update(&mut app, &ctx, &streaming(), Some(1.0));
+        assert_eq!(app.alarms.log.len(), 2, "two rules raised");
+        assert_eq!(pictures(&dir), 0, "off by default");
+
+        // Clear and raise again with the option on.
+        update(&mut app, &ctx, &CameraStatus::default(), None);
+        app.settings.alarms.snapshot_on_raise = true;
+        update(&mut app, &ctx, &streaming(), Some(2.0));
+        update(&mut app, &ctx, &streaming(), Some(3.0));
+        assert_eq!(pictures(&dir), 1);
+        assert!(app
+            .alarms
+            .log
+            .back()
+            .unwrap()
+            .text
+            .starts_with("스냅샷 저장: thermal_"));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

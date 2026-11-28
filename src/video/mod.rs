@@ -8,7 +8,7 @@ pub(crate) mod mf;
 pub mod overlay;
 
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Sender};
+use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::thread::JoinHandle;
 use std::time::Instant;
 
@@ -20,13 +20,43 @@ const NOMINAL_FPS: u32 = 9;
 const FRAME_100NS: i64 = 10_000_000 / NOMINAL_FPS as i64;
 const BITRATE: u32 = 2_000_000;
 
+/// Frames that may wait for the encoder. A scene with the 4× image is about 3 MB, so this
+/// bounds the memory at roughly 100 MB when the encoder cannot keep up; further frames are
+/// skipped (and counted) instead of piling up.
+const BACKLOG: usize = 32;
+
+/// Maps frame times (seconds on any clock) to MP4 sample times (100 ns units). The file starts
+/// at 0 and its times only go forward. When the clock jumps back (seeking back in a playback),
+/// the next frame comes one nominal frame after the last and the timeline follows the clock
+/// from there, so later frames keep their real spacing.
+#[derive(Debug, Default)]
+struct Timeline {
+    /// Clock time that maps to sample time 0.
+    origin: Option<f64>,
+    last: Option<i64>,
+}
+
+impl Timeline {
+    fn next(&mut self, t: f64) -> i64 {
+        let origin = *self.origin.get_or_insert(t);
+        let mut time = ((t - origin) * 1e7).round() as i64;
+        if let Some(last) = self.last.filter(|last| time <= *last) {
+            time = last + FRAME_100NS;
+            self.origin = Some(t - time as f64 / 1e7);
+        }
+        self.last = Some(time);
+        time
+    }
+}
+
 pub struct Mp4Writer {
     path: PathBuf,
-    tx: Option<Sender<(f64, Scene)>>,
+    tx: Option<SyncSender<(f64, Scene)>>,
     thread: Option<JoinHandle<anyhow::Result<u64>>>,
     size: (usize, usize),
     start: Instant,
     sent: u64,
+    skipped: u64,
 }
 
 impl Mp4Writer {
@@ -39,7 +69,7 @@ impl Mp4Writer {
         let path = dir.join(format!("{name}.{EXTENSION}"));
         let (cw, ch) = overlay::canvas_size(width, height);
 
-        let (tx, rx) = mpsc::channel::<(f64, Scene)>();
+        let (tx, rx) = mpsc::sync_channel::<(f64, Scene)>(BACKLOG);
         let (ready_tx, ready_rx) = mpsc::sync_channel::<anyhow::Result<()>>(1);
         let file = path.clone();
         let thread = std::thread::Builder::new()
@@ -60,20 +90,13 @@ impl Mp4Writer {
                     };
                 let text = overlay::Text::load();
                 let mut nv12 = Vec::new();
-                let mut first = None;
-                let mut last: Option<i64> = None;
+                let mut timeline = Timeline::default();
                 let mut n = 0u64;
                 for (t, scene) in rx {
                     if (scene.width, scene.height) != (width, height) {
                         continue;
                     }
-                    let t0 = *first.get_or_insert(t);
-                    let mut time = ((t - t0) * 1e7).round() as i64;
-                    // Times only go forward, also after seeking back in a playback.
-                    if let Some(l) = last.filter(|l| time <= *l) {
-                        time = l + FRAME_100NS;
-                    }
-                    last = Some(time);
+                    let time = timeline.next(t);
                     let cv = overlay::compose(&scene, &text);
                     overlay::to_nv12(&cv, &mut nv12);
                     enc.write(&nv12, time, FRAME_100NS)?;
@@ -97,6 +120,7 @@ impl Mp4Writer {
                 size: (width, height),
                 start: Instant::now(),
                 sent: 0,
+                skipped: 0,
             }),
             failed => {
                 let _ = thread.join();
@@ -126,16 +150,23 @@ impl Mp4Writer {
         self.size
     }
 
-    /// Queue a frame shown at `t` seconds (any clock that only moves forward). Returns false
-    /// when the writer has stopped after an error; [`Self::finish`] then reports it.
+    /// Frames left out because the encoder was behind (see [`BACKLOG`]).
+    pub fn skipped(&self) -> u64 {
+        self.skipped
+    }
+
+    /// Queue a frame shown at `t` seconds. Returns false when the writer has stopped after an
+    /// error; [`Self::finish`] then reports it. A frame the encoder has no room for is skipped
+    /// and counted; that is not an error.
     pub fn push(&mut self, t: f64, scene: Scene) -> bool {
         let Some(tx) = &self.tx else {
             return false;
         };
-        if tx.send((t, scene)).is_err() {
-            return false;
+        match tx.try_send((t, scene)) {
+            Ok(()) => self.sent += 1,
+            Err(TrySendError::Full(_)) => self.skipped += 1,
+            Err(TrySendError::Disconnected(_)) => return false,
         }
-        self.sent += 1;
         true
     }
 
@@ -172,6 +203,7 @@ mod tests {
             rgba: [shade, 255 - shade, 128, 255].repeat(160 * 120),
             lut: (0..=255u8).map(|v| [v, 0, 255 - v]).collect(),
             range: (20.0, 40.0),
+            band: None,
             unit: "°C",
             caption: "test".into(),
             marks: vec![overlay::Mark::Spot {
@@ -211,6 +243,24 @@ mod tests {
         assert_eq!(n, 0);
         assert!(!path.exists(), "no file without frames");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn timeline_keeps_real_spacing_after_a_jump_back() {
+        let mut tl = Timeline::default();
+        let ms = |v: i64| v / 10_000;
+        assert_eq!(tl.next(100.0), 0);
+        assert_eq!(ms(tl.next(100.04)), 40);
+        assert_eq!(ms(tl.next(100.08)), 80);
+        // Seeking back 50 s: one nominal frame later, then real spacing again (not +1/9 s
+        // for every frame until the clock catches up).
+        let back = tl.next(50.0);
+        assert_eq!(back, 800_000 + FRAME_100NS);
+        assert_eq!(ms(tl.next(50.04) - back), 40);
+        assert_eq!(ms(tl.next(50.08) - back), 80);
+        // The same time again still moves forward.
+        let again = tl.next(50.08);
+        assert!(again > back + 800_000);
     }
 
     #[test]

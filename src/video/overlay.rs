@@ -44,6 +44,18 @@ pub enum Mark {
         b: (usize, usize),
         text: String,
     },
+    /// Hottest pixel of a Box.
+    Peak {
+        at: (usize, usize),
+    },
+}
+
+/// The isotherm band, marked beside the color bar. An open end is infinite.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BandMark {
+    pub lo: f32,
+    pub hi: f32,
+    pub color: Rgb,
 }
 
 /// Everything needed to draw one video frame.
@@ -57,6 +69,8 @@ pub struct Scene {
     pub lut: Vec<Rgb>,
     /// Temperatures at the bottom and top of the color bar.
     pub range: (f32, f32),
+    /// Isotherm in use; its pixels are already painted in `rgba`.
+    pub band: Option<BandMark>,
     pub unit: &'static str,
     /// Top-left text (time, calibration).
     pub caption: String,
@@ -381,6 +395,7 @@ pub fn compose(scene: &Scene, text: &Text) -> Canvas {
                 }
                 text.label(&mut cv, pa, (2, -18), bounds, s, SHAPE_COLOR);
             }
+            Mark::Peak { at } => cross(&mut cv, center(*at), 4, SHAPE_COLOR),
         }
     }
 
@@ -396,6 +411,15 @@ pub fn compose(scene: &Scene, text: &Text) -> Canvas {
         }
     }
     let (lo, hi) = scene.range;
+    // The isotherm band: a strip in its color along the part of the bar it covers.
+    if let (Some(band), true) = (scene.band, hi > lo && ih > 1) {
+        let y_of =
+            |v: f32| (((hi - v) / (hi - lo)).clamp(0.0, 1.0) * (ih - 1) as f32).round() as i32;
+        let (top, bottom) = (y_of(band.hi), y_of(band.lo));
+        if bottom > top {
+            cv.fill(bx - 7, top, bx - 2, bottom + 1, band.color);
+        }
+    }
     for k in 0..=4 {
         let t = k as f32 / 4.0;
         let v = hi - (hi - lo) * t;
@@ -425,7 +449,7 @@ fn mix_webcam(cv: &mut Canvas, scene: &Scene, layer: &WebcamLayer) {
         for x in 0..scene.width * SCALE {
             let tx = (x as f32 + 0.5) / SCALE as f32;
             let thermal = cv.get(x, y);
-            let cam = blend::sample(pic, place, tx, ty);
+            let cam = blend::sample(pic, place, tx, ty, layer.overlay.mode);
             let i = (y * cv.width + x) * 3;
             cv.rgb[i..i + 3].copy_from_slice(&blend::mix(&layer.overlay, thermal, cam));
         }
@@ -475,6 +499,7 @@ mod tests {
             rgba,
             lut: (0..=255u8).map(|v| [v, v, v]).collect(),
             range: (20.0, 40.0),
+            band: None,
             unit: "°C",
             caption: "2026-11-25 10:00:00".into(),
             marks: vec![],
@@ -504,6 +529,38 @@ mod tests {
         let x = 640 + 12 + 8;
         assert_eq!(cv.get(x, 0), [255, 255, 255]);
         assert_eq!(cv.get(x, 479), [0, 0, 0]);
+    }
+
+    #[test]
+    fn isotherm_band_is_marked_beside_the_bar() {
+        let mut s = scene();
+        let color = [0, 235, 70];
+        // 30 °C and above, on a 20–40 °C bar: the upper half.
+        s.band = Some(BandMark {
+            lo: 30.0,
+            hi: f32::INFINITY,
+            color,
+        });
+        let cv = compose(&s, &Text::none());
+        let x = 640 + 12 - 4;
+        assert_eq!(cv.get(x, 0), color);
+        assert_eq!(cv.get(x, 230), color);
+        assert_eq!(cv.get(x, 250), [0, 0, 0]);
+        assert_eq!(cv.get(x, 479), [0, 0, 0]);
+        // A band outside the bar's range marks nothing.
+        s.band = Some(BandMark {
+            lo: 50.0,
+            hi: 60.0,
+            color,
+        });
+        let cv = compose(&s, &Text::none());
+        assert!((0..480).all(|y| cv.get(x, y) == [0, 0, 0]));
+        // The hottest pixel of a box gets a small cross.
+        s.marks = vec![Mark::Peak { at: (100, 60) }];
+        let cv = compose(&s, &Text::none());
+        assert_eq!(cv.get(402, 242), SHAPE_COLOR);
+        assert_eq!(cv.get(402 + 4, 242), SHAPE_COLOR);
+        assert_eq!(cv.get(402 + 8, 242), [0, 0, 0]);
     }
 
     #[test]

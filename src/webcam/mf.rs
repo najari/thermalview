@@ -86,10 +86,24 @@ fn string(device: &IMFActivate, key: &GUID) -> windows::core::Result<String> {
     }
 }
 
+/// A device source that is shut down when dropped. Only releasing it can leave the camera in
+/// use until the program ends, so this also covers every error path of [`Reader::open`].
+struct Source(IMFMediaSource);
+
+impl Drop for Source {
+    fn drop(&mut self) {
+        // SAFETY: plain COM call on the source this owns; shutting down twice is harmless.
+        unsafe {
+            let _ = self.0.Shutdown();
+        }
+    }
+}
+
 /// An open webcam delivering RGB32 frames.
 pub struct Reader {
+    // Before `_source`: the reader is released first, then the camera is shut down.
     reader: Option<IMFSourceReader>,
-    source: IMFMediaSource,
+    _source: Source,
     width: usize,
     height: usize,
     /// Bytes per row; negative when rows are stored bottom-up. Only used when the buffer has
@@ -117,11 +131,11 @@ impl Reader {
                 &MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_SYMBOLIC_LINK,
                 &link,
             )?;
-            let source = MFCreateDeviceSource(&attrs).context("cannot open the camera")?;
+            let source = Source(MFCreateDeviceSource(&attrs).context("cannot open the camera")?);
             let options = attributes(1)?;
             // Lets the reader convert MJPG / YUY2 / NV12 to RGB32.
             options.SetUINT32(&MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, 1)?;
-            let reader = MFCreateSourceReaderFromMediaSource(&source, &options)
+            let reader = MFCreateSourceReaderFromMediaSource(&source.0, &options)
                 .context("cannot read from the camera")?;
             if let Some(native) = best_native_type(&reader) {
                 // Not fatal: the reader then keeps the camera's default format.
@@ -139,7 +153,7 @@ impl Reader {
         };
         let mut r = Self {
             reader: Some(reader),
-            source,
+            _source: source,
             width: 0,
             height: 0,
             stride: 0,
@@ -219,9 +233,10 @@ impl Reader {
             }
         };
         // SAFETY: the buffer is locked while read and unlocked before it is released. With a 2-D
-        // lock, row y starts at scan0 + y × pitch for `height` rows of at least |pitch| bytes;
-        // otherwise the contiguous length is checked against |stride| × height first. Only
-        // `row_bytes` (≤ |pitch|) bytes of each row are read.
+        // lock, row y starts at scan0 + y × pitch for `height` rows of at least |pitch| bytes,
+        // and the buffer's own size (without row padding) is checked to hold `height` rows of
+        // this picture; otherwise the contiguous length is checked against |stride| × height
+        // first. Only `row_bytes` (≤ |pitch|) bytes of each row are read.
         unsafe {
             let buf = sample.ConvertToContiguousBuffer()?;
             if let Ok(b2) = buf.cast::<IMF2DBuffer>() {
@@ -232,7 +247,13 @@ impl Reader {
                     self.logged = true;
                     log::info!("webcam: 2-D buffer, pitch {pitch}");
                 }
-                if scan0.is_null() || (pitch.unsigned_abs() as usize) < row_bytes {
+                // What the picture needs without padding; a buffer for another (smaller) size
+                // must not be read as this one.
+                let holds = b2.GetContiguousLength().unwrap_or(0) as usize;
+                if scan0.is_null()
+                    || (pitch.unsigned_abs() as usize) < row_bytes
+                    || holds < row_bytes * h
+                {
                     let _ = b2.Unlock2D();
                     anyhow::bail!("unexpected camera buffer layout");
                 }
@@ -263,17 +284,6 @@ impl Reader {
             }
         }
         Ok(Some((w, h, rgba)))
-    }
-}
-
-impl Drop for Reader {
-    fn drop(&mut self) {
-        // Release the reader first, then make sure the camera is stopped and freed for others.
-        self.reader = None;
-        // SAFETY: plain COM call on the source created in `open`; shutting down twice is harmless.
-        unsafe {
-            let _ = self.source.Shutdown();
-        }
     }
 }
 

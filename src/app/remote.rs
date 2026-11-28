@@ -3,14 +3,15 @@
 
 use eframe::egui::{self, Color32};
 
-use super::{calibration, webcam, ThermalApp};
+use super::{calibration, view, webcam, Hold, ThermalApp};
 use crate::camera::{CameraStatus, ConnState, HEIGHT, WIDTH};
-use crate::remote::server::{Reply, Server};
-use crate::remote::{self as proto, RangeSet, Request};
+use crate::remote::server::{Pending, Reply, Server};
+use crate::remote::{self as proto, IsoSet, RangeSet, Request};
 use crate::settings::RemoteSettings;
 use crate::thermal::alarm::Suspended;
 use crate::thermal::calibration::MIN_EMISSIVITY;
 use crate::thermal::frame::ThermalFrame;
+use crate::thermal::isotherm::Band;
 use crate::thermal::measure::Spot;
 use crate::thermal::range::RangeMode;
 
@@ -49,14 +50,21 @@ pub(super) fn sync(app: &mut ThermalApp, ctx: &egui::Context) {
         Ok(s) => app.remote.server = Some(s),
         Err(e) => {
             log::warn!("remote control: cannot listen on port {}: {e}", want.port);
-            app.remote.error = Some(format!("포트 {}을(를) 열 수 없습니다: {e}", want.port));
+            let msg = format!("포트 {}을(를) 열 수 없습니다: {e}", want.port);
+            // Also in the status line: the panel section may be folded.
+            app.notify(format!("원격 제어: {msg}"));
+            app.remote.error = Some(msg);
         }
     }
 }
 
 /// Answer every command that is waiting.
-pub(super) fn process(app: &mut ThermalApp, status: &CameraStatus) {
+pub(super) fn process(app: &mut ThermalApp, ctx: &egui::Context, status: &CameraStatus) {
     while let Some(p) = app.remote.server.as_ref().and_then(Server::try_recv) {
+        if p.request == Request::Screenshot {
+            screenshot(app, ctx, p);
+            continue;
+        }
         let r = execute(app, status, p.request);
         match &r {
             Ok(_) => log::debug!("remote {}: {:?}", p.peer, p.request),
@@ -64,6 +72,30 @@ pub(super) fn process(app: &mut ThermalApp, status: &CameraStatus) {
         }
         p.respond(r);
     }
+}
+
+/// `SCREENSHOT`: answered once the next drawn frame has been captured and saved. A minimized
+/// window is not drawn, so the client then gets the server's "not responding" answer.
+fn screenshot(app: &ThermalApp, ctx: &egui::Context, p: Pending) {
+    let dir = app.settings.snapshot_dir();
+    ctx.request_screenshot(move |image| p.respond(save_window(&dir, &image)));
+}
+
+fn save_window(dir: &std::path::Path, image: &egui::ColorImage) -> Reply {
+    std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    let name = chrono::Local::now()
+        .format("window_%Y%m%d_%H%M%S_%3f.png")
+        .to_string();
+    let path = dir.join(name);
+    image::save_buffer(
+        &path,
+        image.as_raw(),
+        image.width() as u32,
+        image.height() as u32,
+        image::ExtendedColorType::Rgba8,
+    )
+    .map_err(|e| format!("cannot write the picture: {e}"))?;
+    Ok(path.display().to_string())
 }
 
 fn frame(app: &ThermalApp) -> Result<&ThermalFrame, String> {
@@ -167,6 +199,10 @@ pub(super) fn execute(app: &mut ThermalApp, status: &CameraStatus, req: Request)
                     app.auto_range.reset();
                     RangeMode::Auto
                 }
+                RangeSet::Robust => {
+                    app.auto_range.reset();
+                    RangeMode::Robust
+                }
                 RangeSet::Manual { lo, hi } => RangeMode::Manual { lo, hi },
             };
             app.mark_dirty();
@@ -219,6 +255,47 @@ pub(super) fn execute(app: &mut ThermalApp, status: &CameraStatus, req: Request)
             ))
         }
         Request::Align => webcam::auto_align_now(app),
+        Request::Freeze(None) => Ok(on_off(app.hold.is_some()).into()),
+        Request::Freeze(Some(on)) => {
+            app.set_hold(on)?;
+            Ok(on_off(app.hold.is_some()).into())
+        }
+        Request::Isotherm(None) => Ok(isotherm_line(app)),
+        Request::Isotherm(Some(set)) => {
+            let iso = &mut app.settings.isotherm;
+            iso.enabled = set != IsoSet::Off;
+            match set {
+                IsoSet::Off => {}
+                IsoSet::Above(t) => (iso.band, iso.lo) = (Band::Above, t),
+                IsoSet::Below(t) => (iso.band, iso.hi) = (Band::Below, t),
+                IsoSet::Between(lo, hi) => (iso.band, iso.lo, iso.hi) = (Band::Between, lo, hi),
+            }
+            app.mark_dirty();
+            app.render();
+            Ok(isotherm_line(app))
+        }
+        Request::Filter(None) => Ok(app.settings.noise_filter.max(1).to_string()),
+        Request::Filter(Some(n)) => {
+            app.settings.noise_filter = n;
+            app.mark_dirty();
+            Ok(n.to_string())
+        }
+        Request::Zoom(None) => Ok(zoom_line(app)),
+        Request::Zoom(Some(z)) => {
+            let (w, h) = dims(app);
+            let (w, h) = (w as f32, h as f32);
+            let center = match z.center {
+                Some((x, y)) => {
+                    check_pixel(app, x, y)?;
+                    (x as f32 + 0.5, y as f32 + 0.5)
+                }
+                None => app.zoom.center(w, h),
+            };
+            app.zoom = view::Zoom::centered(z.factor, center, w, h);
+            Ok(zoom_line(app))
+        }
+        // Answered by `process`, which has the window to capture.
+        Request::Screenshot => Err("no window to capture".into()),
     }
 }
 
@@ -247,10 +324,11 @@ fn status_line(app: &ThermalApp, status: &CameraStatus) -> String {
          cal={} alarms={active}",
         status.fps,
         status.frames,
-        if app.player.is_some() {
-            "playback"
-        } else {
-            "live"
+        match (&app.player, &app.hold) {
+            (Some(_), _) => "playback",
+            (None, Some(Hold::Frozen)) => "frozen",
+            (None, Some(Hold::Snapshot(_))) => "snapshot",
+            (None, None) => "live",
         },
         on_off(app.csv.is_some()),
         on_off(app.seq.is_some()),
@@ -298,9 +376,44 @@ fn measure(app: &ThermalApp) -> Reply {
     Ok(out)
 }
 
+/// "off", "above 60.00", "below 10.00" or "between 30.00 35.00", then the share of the image
+/// inside the band.
+fn isotherm_line(app: &ThermalApp) -> String {
+    let iso = &app.settings.isotherm;
+    if !iso.enabled {
+        return "off".into();
+    }
+    let band = match iso.band {
+        Band::Above => format!("above {}", num(iso.lo)),
+        Band::Below => format!("below {}", num(iso.hi)),
+        Band::Between => format!(
+            "between {} {}",
+            num(iso.lo.min(iso.hi)),
+            num(iso.lo.max(iso.hi))
+        ),
+    };
+    match app.iso_share {
+        Some(share) => format!("{band} pixels={:.1}%", share * 100.0),
+        None => band,
+    }
+}
+
+/// Magnification and the thermal pixel in the middle of the view.
+fn zoom_line(app: &ThermalApp) -> String {
+    let (w, h) = dims(app);
+    let (x, y) = app.zoom.center(w as f32, h as f32);
+    format!(
+        "{:.2} center={:.0},{:.0}",
+        app.zoom.factor,
+        x.floor(),
+        y.floor()
+    )
+}
+
 fn range_line(app: &ThermalApp) -> String {
     let mode = match app.settings.range {
         RangeMode::Auto => "auto",
+        RangeMode::Robust => "robust",
         RangeMode::Manual { .. } => "manual",
     };
     let (lo, hi) = app.display_range;
@@ -313,6 +426,7 @@ fn alarms_line(app: &ThermalApp) -> String {
     let monitoring = match m.suspended() {
         None => "on",
         Some(Suspended::Playback) => "playback",
+        Some(Suspended::Frozen) => "frozen",
         Some(Suspended::NoSignal) => "nosignal",
         Some(Suspended::NotRadiometric) => "counts",
     };
@@ -333,8 +447,19 @@ fn alarms_line(app: &ThermalApp) -> String {
 }
 
 /// Settings panel section.
+/// One-line state for the header of the panel section.
+pub(super) fn summary(app: &ThermalApp) -> String {
+    if !app.settings.remote.enabled {
+        return "꺼짐".into();
+    }
+    match (&app.remote.server, &app.remote.error) {
+        (Some(s), _) => format!("포트 {} · 연결 {}", s.addr().port(), s.clients()),
+        (None, Some(_)) => "오류".into(),
+        (None, None) => "시작 중".into(),
+    }
+}
+
 pub(super) fn controls(ui: &mut egui::Ui, app: &mut ThermalApp) {
-    ui.heading("원격 제어");
     let before = app.settings.remote;
     let r = &mut app.settings.remote;
     ui.checkbox(&mut r.enabled, "TCP 원격 제어 사용")
@@ -452,6 +577,75 @@ mod tests {
         assert!(run(&mut app, "EMISSIVITY 0.05").is_err());
         assert!(run(&mut app, "EMISSIVITY 1.5").is_err());
         assert_eq!(run(&mut app, "EMISSIVITY").unwrap(), "0.950");
+    }
+
+    #[test]
+    fn view_commands() {
+        let mut app = rig();
+        // One pixel of 19,200 is 10 K hotter: 36.85 °C in a 26.85 °C image.
+        assert_eq!(run(&mut app, "ISOTHERM").unwrap(), "off");
+        assert_eq!(
+            run(&mut app, "ISOTHERM ABOVE 30").unwrap(),
+            "above 30.00 pixels=0.0%"
+        );
+        assert_eq!(app.iso_share, Some(1.0 / 19200.0));
+        assert_eq!(
+            run(&mut app, "ISOTHERM BELOW 30").unwrap(),
+            "below 30.00 pixels=100.0%"
+        );
+        assert!(run(&mut app, "ISOTHERM BETWEEN 20 30")
+            .unwrap()
+            .starts_with("between 20.00 30.00 "));
+        assert_eq!(run(&mut app, "ISOTHERM OFF").unwrap(), "off");
+        assert!(app.iso_share.is_none());
+
+        assert!(run(&mut app, "RANGE ROBUST")
+            .unwrap()
+            .starts_with("robust 25.85 27.85"));
+        assert_eq!(app.settings.range, RangeMode::Robust);
+
+        assert_eq!(run(&mut app, "FILTER").unwrap(), "1");
+        assert_eq!(run(&mut app, "FILTER 8").unwrap(), "8");
+        assert_eq!(app.settings.noise_filter, 8);
+        assert_eq!(run(&mut app, "FILTER OFF").unwrap(), "1");
+
+        assert_eq!(run(&mut app, "ZOOM").unwrap(), "1.00 center=80,60");
+        assert_eq!(
+            run(&mut app, "ZOOM 4 100 40").unwrap(),
+            "4.00 center=100,40"
+        );
+        // Only the magnification: the middle of the view stays.
+        assert_eq!(run(&mut app, "ZOOM 2").unwrap(), "2.00 center=100,40");
+        // A corner cannot be in the middle.
+        assert_eq!(run(&mut app, "ZOOM 2 0 0").unwrap(), "2.00 center=40,30");
+        assert!(run(&mut app, "ZOOM 2 160 0").is_err());
+        assert_eq!(run(&mut app, "ZOOM 1").unwrap(), "1.00 center=80,60");
+    }
+
+    #[test]
+    fn freezing_holds_the_frame() {
+        let mut app = rig();
+        assert_eq!(run(&mut app, "FREEZE").unwrap(), "off");
+        assert_eq!(run(&mut app, "FREEZE ON").unwrap(), "on");
+        assert!(run(&mut app, "STATUS").unwrap().contains(" source=frozen "));
+        // The held frame is still measured; nothing can be recorded from it.
+        assert!(run(&mut app, "MEAS").unwrap().starts_with("seq=7 "));
+        assert!(run(&mut app, "CSV START")
+            .unwrap_err()
+            .contains("FREEZE OFF"));
+        assert!(run(&mut app, "REC START").is_err());
+        assert!(run(&mut app, "MP4 START").is_err());
+        assert_eq!(
+            run(&mut app, "FREEZE ON").unwrap(),
+            "on",
+            "asking twice is fine"
+        );
+        assert_eq!(run(&mut app, "FREEZE OFF").unwrap(), "off");
+        assert!(run(&mut app, "STATUS").unwrap().contains(" source=live "));
+
+        let mut empty = ThermalApp::with_camera(Settings::default(), Camera::disconnected());
+        assert!(run(&mut empty, "FREEZE ON").is_err());
+        assert_eq!(run(&mut empty, "FREEZE OFF").unwrap(), "off");
     }
 
     #[test]

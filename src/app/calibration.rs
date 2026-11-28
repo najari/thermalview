@@ -136,6 +136,13 @@ pub(super) fn update(app: &mut ThermalApp, status: &CameraStatus, new_live: Opti
         app.notify("기준점 기록을 취소했습니다: 실시간 영상이 아닙니다");
         return;
     }
+    // The correction must not change inside one CSV file, also when the log was started
+    // (from the toolbar or a remote client) after this capture.
+    if app.csv.is_some() {
+        app.cal.capture = None;
+        app.notify("기준점 기록을 취소했습니다: CSV 기록 중에는 보정을 바꿀 수 없습니다");
+        return;
+    }
     let (Some(_), Some(f)) = (new_live, &app.frame) else {
         return;
     };
@@ -173,7 +180,6 @@ pub(super) fn update(app: &mut ThermalApp, status: &CameraStatus, new_live: Opti
 
 /// Settings panel section.
 pub(super) fn controls(ui: &mut egui::Ui, app: &mut ThermalApp, status: &CameraStatus) {
-    ui.heading("온도 보정");
     if let Some(e) = status.camera_emissivity {
         if (e - 1.0).abs() > 0.001 {
             ui.colored_label(

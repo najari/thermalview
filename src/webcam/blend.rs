@@ -224,17 +224,30 @@ pub struct WebcamSample {
 }
 
 /// Sample `picture` where it covers point (tx, ty) of the thermal image (thermal pixel units),
-/// given its `placement` from [`Alignment::placement`].
-pub fn sample(picture: &Picture, placement: [f32; 4], tx: f32, ty: f32) -> Option<WebcamSample> {
+/// given its `placement` from [`Alignment::placement`]. Only what `mode` mixes in is looked up
+/// (the color for [`Mode::Blend`], the edge strength for [`Mode::Edges`]); the other is 0.
+pub fn sample(
+    picture: &Picture,
+    placement: [f32; 4],
+    tx: f32,
+    ty: f32,
+    mode: Mode,
+) -> Option<WebcamSample> {
     let [x0, y0, x1, y1] = placement;
     if x1 <= x0 || y1 <= y0 {
         return None;
     }
     let u = (tx - x0) / (x1 - x0) * picture.width as f32;
     let v = (ty - y0) / (y1 - y0) * picture.height as f32;
-    Some(WebcamSample {
-        color: picture.color_at(u, v)?,
-        edge: picture.edge_at(u, v)?,
+    Some(match mode {
+        Mode::Blend => WebcamSample {
+            color: picture.color_at(u, v)?,
+            edge: 0.0,
+        },
+        Mode::Edges => WebcamSample {
+            color: [0.0; 3],
+            edge: picture.edge_at(u, v)?,
+        },
     })
 }
 
@@ -314,7 +327,7 @@ mod tests {
     fn mixing_matches_the_screen() {
         let pic = solid(64, 48, [0, 0, 200]);
         let place = Alignment::default().placement((160, 120), (64, 48));
-        let inside = sample(&pic, place, 80.0, 60.0);
+        let inside = sample(&pic, place, 80.0, 60.0, Mode::Blend);
         let blend = Overlay::default();
         assert_eq!(mix(&blend, [200, 0, 0], inside), [100, 0, 100]);
         // Where the webcam picture does not reach: the thermal image over black.
@@ -323,7 +336,7 @@ mod tests {
             ..Default::default()
         };
         let place = half.placement((160, 120), (64, 48));
-        let outside = sample(&pic, place, 5.0, 5.0);
+        let outside = sample(&pic, place, 5.0, 5.0, Mode::Blend);
         assert!(outside.is_none());
         assert_eq!(mix(&blend, [200, 0, 0], outside), [100, 0, 0]);
 

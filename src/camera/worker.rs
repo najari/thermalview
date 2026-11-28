@@ -436,7 +436,10 @@ impl Watch {
 
     /// Update the state and frame rate. Returns false when the stream has stalled.
     fn check(&mut self, shared: &Shared) -> bool {
-        let idle = shared.now_ms() - shared.last_frame_ms.load(Ordering::Relaxed);
+        // The frame callback may store a newer time between the two reads.
+        let idle = shared
+            .now_ms()
+            .saturating_sub(shared.last_frame_ms.load(Ordering::Relaxed));
         let got_frame = self.streamed(shared);
         if got_frame && !self.streaming {
             self.streaming = true;

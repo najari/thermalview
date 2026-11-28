@@ -28,7 +28,7 @@
 | 명령 | 응답 예 | 설명 |
 | --- | --- | --- |
 | `HELP` | `OK commands: ...` | 명령 목록 |
-| `STATUS` | `OK state=streaming fps=8.9 frames=1234 fpa=31.00 unit=C source=live csv=off rec=off mp4=off cal=off alarms=0` | 연결 상태(`starting`, `searching`, `busy`, `streaming`, `stalled`, `replug`), 초당 프레임, 받은 프레임 수, 센서 온도, 영상 출처(`live`/`playback`), CSV·녹화·MP4·보정 여부, 발생 중인 경보 수 |
+| `STATUS` | `OK state=streaming fps=8.9 frames=1234 fpa=31.00 unit=C source=live csv=off rec=off mp4=off cal=off alarms=0` | 연결 상태(`starting`, `searching`, `busy`, `streaming`, `stalled`, `replug`), 초당 프레임, 받은 프레임 수, 센서 온도, 영상 출처(`live`, `playback`, `frozen` = 화면 정지, `snapshot` = 다시 연 스냅샷), CSV·녹화·MP4·보정 여부, 발생 중인 경보 수 |
 | `MEAS` | `OK seq=170 time=2026-11-25T10:04:16.856+09:00 unit=C max=42.51 min=29.56 mean=33.45 center=33.59 maxpos=3,79 minpos=0,1 S1=33.59 B2.max=... B2.min=... B2.mean=...` | 현재 프레임의 최고·최저·평균·중앙(3×3 평균), 최고·최저 위치, 측정점 `S<id>`, 영역·선 `B<id>`/`L<id>`의 최고·최저·평균 |
 | `TEMP x y` | `OK 33.59` | 화소 (x, y) 주변 3×3 평균. x는 0~159, y는 0~119 |
 | `SPOT` 또는 `SPOT LIST` | `OK S1=80,60 S3=10,20` | 측정점 목록 |
@@ -37,16 +37,23 @@
 | `SPOT CLEAR` | `OK` | 측정점 모두 삭제. 번호는 이어서 매깁니다 |
 | `PALETTE [이름]` | `OK ironbow` | 팔레트 읽기·바꾸기: `ironbow`, `rainbow`, `whitehot`, `blackhot`, `lava` |
 | `RANGE` | `OK auto 29.54 42.51` | 눈금 방식과 지금 쓰는 범위 |
-| `RANGE AUTO` / `RANGE lo hi` | `OK manual 20.00 40.00` | 자동 범위 / 수동 범위 |
+| `RANGE AUTO` / `RANGE ROBUST` / `RANGE lo hi` | `OK manual 20.00 40.00` | 자동 범위 / 가장 차갑고 뜨거운 화소 1 %씩을 뺀 자동 범위(`robust`) / 수동 범위 |
+| `ISOTHERM` | `OK above 60.00 pixels=3.9%` 또는 `OK off` | 등온선 상태와 지금 영상에서 해당하는 화소 비율 |
+| `ISOTHERM ABOVE t` / `BELOW t` / `BETWEEN lo hi` / `OFF` | `OK between 30.00 35.00 pixels=12.0%` | 기준 이상·이하·구간의 화소를 한 색으로 칠함(화면, 스냅샷 컬러 PNG, MP4). 측정값은 바뀌지 않음. 색은 화면에서 고름 |
+| `FILTER [n]` | `OK 8` | 잡음 필터 세기 읽기·바꾸기: `1`(또는 `OFF`) 끔, `2`, `4`, `8`, `16`프레임 평균. 켜면 `MEAS`·`TEMP`·`FRAME`·CSV·경보가 필터를 거친 값. `.tvseq` 녹화에는 필터 전 원본이 저장됨 |
+| `FREEZE` | `OK off` | 화면 정지 여부 |
+| `FREEZE ON` / `FREEZE OFF` | `OK on` | 지금 프레임을 붙잡아 둠 / 실시간으로 돌아감. 정지 동안 카메라 프레임은 버려지고 `MEAS`·`TEMP`·`FRAME`·`SNAPSHOT`은 붙잡은 프레임을 대상으로 함. CSV·녹화·MP4 기록 중이거나 재생 중에는 `ERR`, 정지 중 `CSV START`·`REC START`·`MP4 START`도 `ERR`. 경보 감시는 정지 동안 중단(`ALARMS`의 `monitoring=frozen`). 다시 연 스냅샷에서 `FREEZE OFF`를 보내면 스냅샷을 닫고 실시간으로 돌아감 |
+| `ZOOM [배율 [x y]]` | `OK 2.50 center=110,80` | 영상 보기의 확대 배율(1~8)과 화면 가운데의 화소. `x y`를 주면 그 화소를 가운데로(가장자리에서는 영상 끝에 맞춤). 화면에만 적용되고 스냅샷·MP4는 항상 전체 영상 |
 | `ROTATE [도]` | `OK 90` | 실시간 영상 회전 읽기·바꾸기(시계 방향 0, 90, 180, 270). 측정점·영역도 같은 장면 위치로 옮겨짐. 재생 중과 CSV·녹화·MP4 기록 중에는 바꿀 수 없음 |
 | `EMISSIVITY [e]` | `OK 0.950` | 방사율 읽기·바꾸기(0.10~1.00). CSV 기록 중에는 바꿀 수 없음 |
-| `ALARMS` | `OK enabled=on monitoring=on R1=active R2=clear` | 경보 감시 상태(`on`, `playback`, `nosignal`, `counts`)와 규칙별 상태(`active`, `pending`, `clear`, `off`) |
+| `ALARMS` | `OK enabled=on monitoring=on R1=active R2=clear` | 경보 감시 상태(`on`, `playback`, `frozen`, `nosignal`, `counts`)와 규칙별 상태(`active`, `pending`, `clear`, `off`) |
 | `SNAPSHOT` | `OK C:\...\thermal_20261125_100417_368.png` | 스냅샷 저장(컬러 PNG, 16비트 PNG, JSON). 컬러 PNG 경로를 돌려줌 |
 | `CSV START` / `CSV STOP` | `OK C:\...\thermal_log_....csv` / `OK rows=86 C:\...` | 측정값 CSV 기록 |
 | `REC START` / `REC STOP` | `OK C:\...\thermal_seq_....tvseq` / `OK frames=169 C:\...` | 온도 원본 녹화. 재생 중에는 시작할 수 없음 |
 | `MP4 START` / `MP4 STOP` | `OK C:\...\thermal_video_....mp4` / `OK frames=169 C:\...` | 보이는 영상(팔레트, 측정 표시, 색 막대, 시각)을 MP4로 녹화. 재생 중이면 재생 화면을 녹화. 프레임 없이 멈추면 파일을 만들지 않고 `ERR no frames were recorded; no file written` |
 | `FRAME` | `OK w=160 h=120 seq=174 k=0.01 data=VHZm...` | 현재 프레임의 원시값. `data`는 little-endian u16을 base64로 인코딩한 값(38,400바이트 → 51,200자). 섭씨 = 값 × k − 273.15. TLinear가 꺼져 있으면 `k=none` |
 | `ALIGN` | `OK scale=1.352 dx=-0.027 dy=0.089 score=0.44` | 웹캠 합성의 자동 정렬(설정 패널의 "자동 정렬"과 같음). 믿을 만하면(일치도 0.25 이상) 정렬을 바꾸고, 아니면 바꾸지 않고 `ERR …`. 웹캠 합성이 꺼져 있거나 재생 중이면 `ERR`. 약 0.3~1초 걸리고 그동안 창이 멈춤 |
+| `SCREENSHOT` | `OK C:\...\window_20261128_084527_640.png` | 앱 창 전체(도구 막대, 설정 패널, 영상, 그래프)를 그려진 그대로 PNG로 저장 폴더에 저장. 창이 다른 창에 가려져 있어도 됨. 창이 최소화돼 있으면 그려지지 않으므로 `ERR application not responding` |
 | `QUIT` | `OK bye` | 연결 종료 |
 
 프레임이 아직 없으면 측정·저장 명령은 `ERR no frame yet`을 돌려줍니다.
@@ -59,7 +66,8 @@
 - 창을 최소화해도 응답하고, 그동안에도 CSV 기록·녹화·경보가 모든 프레임에 대해 계속됩니다.
 - 응답 시간: 창이 보일 때 약 1~50 ms, 최소화했을 때 약 100 ms.
 - 앱이 3초 안에 응답하지 못하면 `ERR application not responding`을 돌려줍니다.
-- 재생 중에는 `MEAS`, `FRAME`, `SNAPSHOT`이 재생 중인 프레임을 대상으로 합니다(`STATUS`의 `source=playback`).
+- 재생 중에는 `MEAS`, `FRAME`, `SNAPSHOT`이 재생 중인 프레임을 대상으로 합니다(`STATUS`의 `source=playback`). 화면 정지나 다시 연 스냅샷에서는 화면에 붙잡혀 있는 프레임이 대상입니다(`source=frozen`, `source=snapshot`).
+- 웹캠 합성과 4배 업스케일을 함께 켠 채 `MP4 STOP`을 보내면 마무리가 3초를 넘겨 `ERR application not responding`이 올 수 있습니다. 파일은 저장되므로 `STATUS`의 `mp4=off`로 확인하세요.
 
 ## 예
 

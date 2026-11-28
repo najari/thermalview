@@ -5,6 +5,7 @@ use egui_plot::{Bar, BarChart, Legend, Line, Plot};
 
 use super::ThermalApp;
 use crate::thermal::histogram::Histogram;
+use crate::thermal::history::ShapeValue;
 use crate::thermal::shapes::ShapeKind;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -15,7 +16,6 @@ pub enum Tab {
 }
 
 pub struct GraphState {
-    pub visible: bool,
     tab: Tab,
     /// Time window shown, in seconds.
     window: f64,
@@ -23,18 +23,22 @@ pub struct GraphState {
     show_min: bool,
     show_mean: bool,
     show_center: bool,
+    /// Maximum / mean of each Box and Line.
+    show_shape_max: bool,
+    show_shape_mean: bool,
 }
 
 impl Default for GraphState {
     fn default() -> Self {
         Self {
-            visible: true,
             tab: Tab::Time,
             window: 60.0,
             show_max: true,
             show_min: true,
             show_mean: false,
             show_center: false,
+            show_shape_max: true,
+            show_shape_mean: false,
         }
     }
 }
@@ -52,10 +56,22 @@ const SPOT_COLORS: [Color32; 6] = [
     Color32::from_rgb(200, 120, 60),
 ];
 
+/// Legend on the left, where the oldest samples are: the newest values stay uncovered. Entries
+/// in the order they were added (S2 before S10), small and see-through.
+fn legend() -> Legend {
+    Legend::default()
+        .position(egui_plot::Corner::LeftTop)
+        .text_style(egui::TextStyle::Small)
+        .background_alpha(0.6)
+        .follow_insertion_order(true)
+}
+
 pub(super) fn show(ui: &mut egui::Ui, app: &mut ThermalApp) {
     let unit = app.frame.as_ref().map(|f| f.unit()).unwrap_or("°C");
     let g = &mut app.graphs;
-    ui.horizontal(|ui| {
+    // Wrapped: a row wider than the panel would widen the plot under it too, and push the
+    // newest seconds out of the window.
+    ui.horizontal_wrapped(|ui| {
         ui.selectable_value(&mut g.tab, Tab::Time, "시간 그래프");
         ui.selectable_value(&mut g.tab, Tab::Histogram, "히스토그램");
         ui.selectable_value(&mut g.tab, Tab::Profile, "선 프로파일");
@@ -69,6 +85,12 @@ pub(super) fn show(ui: &mut egui::Ui, app: &mut ThermalApp) {
             ui.checkbox(&mut g.show_min, "최저");
             ui.checkbox(&mut g.show_mean, "평균");
             ui.checkbox(&mut g.show_center, "중앙");
+            if !app.settings.shapes.items.is_empty() {
+                ui.separator();
+                ui.checkbox(&mut g.show_shape_max, "영역 최고")
+                    .on_hover_text("영역(B)과 선(L)마다 그 안의 최고 온도");
+                ui.checkbox(&mut g.show_shape_mean, "영역 평균");
+            }
             if ui.button("지우기").clicked() {
                 app.history.clear();
             }
@@ -107,7 +129,7 @@ fn profile_plot(ui: &mut egui::Ui, app: &ThermalApp, unit: &str) {
         return;
     }
     Plot::new("profile")
-        .legend(Legend::default())
+        .legend(legend())
         .x_axis_label("거리 (화소)")
         .y_axis_label(unit.to_string())
         .allow_scroll(false)
@@ -150,10 +172,27 @@ fn time_plot(ui: &mut egui::Ui, app: &ThermalApp, unit: &str) {
             h.spot_points(s.id, window),
         );
     }
+    // Boxes and lines continue the spot colors; the mean is the same color, thinner in tone.
+    let spots = app.settings.spots.items.len();
+    for (i, s) in app.settings.shapes.items.iter().enumerate() {
+        let color = SPOT_COLORS[(spots + i) % SPOT_COLORS.len()];
+        add(
+            g.show_shape_max,
+            &format!("{} 최고", s.label()),
+            color,
+            h.shape_points(s.id, window, ShapeValue::Max),
+        );
+        add(
+            g.show_shape_mean,
+            &format!("{} 평균", s.label()),
+            color.gamma_multiply(0.6),
+            h.shape_points(s.id, window, ShapeValue::Mean),
+        );
+    }
 
     let unit = unit.to_string();
     Plot::new("time_plot")
-        .legend(Legend::default())
+        .legend(legend())
         .x_axis_label("초 (0 = 지금)")
         .y_axis_label(unit.clone())
         .default_x_bounds(-window, 0.0)

@@ -84,20 +84,22 @@ impl Shape {
     }
 
     pub fn stats(&self, f: &ThermalFrame) -> Option<ShapeStats> {
-        let px = self.pixels(f.width, f.height);
-        let first = *px.first()?;
+        if f.width == 0 || f.height == 0 {
+            return None;
+        }
         let mut s = ShapeStats {
             min: f32::MAX,
             max: f32::MIN,
             mean: 0.0,
-            min_pos: first,
-            max_pos: first,
-            pixels: px.len(),
+            min_pos: (0, 0),
+            max_pos: (0, 0),
+            pixels: 0,
         };
         let mut sum = 0.0f64;
-        for (x, y) in px {
+        let mut add = |x: usize, y: usize| {
             let v = f.value(f.at(x, y));
             sum += v as f64;
+            s.pixels += 1;
             if v < s.min {
                 s.min = v;
                 s.min_pos = (x, y);
@@ -106,6 +108,27 @@ impl Shape {
                 s.max = v;
                 s.max_pos = (x, y);
             }
+        };
+        match self.kind {
+            // Rows directly: this runs for every frame, and a pixel list of a large box is
+            // hundreds of kilobytes.
+            ShapeKind::Box => {
+                let clamp = |(x, y): (usize, usize)| (x.min(f.width - 1), y.min(f.height - 1));
+                let (a, b) = (clamp(self.a), clamp(self.b));
+                for y in a.1.min(b.1)..=a.1.max(b.1) {
+                    for x in a.0.min(b.0)..=a.0.max(b.0) {
+                        add(x, y);
+                    }
+                }
+            }
+            ShapeKind::Line => {
+                for (x, y) in self.pixels(f.width, f.height) {
+                    add(x, y);
+                }
+            }
+        }
+        if s.pixels == 0 {
+            return None;
         }
         s.mean = (sum / s.pixels as f64) as f32;
         Some(s)
@@ -184,11 +207,20 @@ impl Shape {
     /// This shape after dragging by (dx, dy) pixels, kept inside a w×h frame. A whole-shape move
     /// stops at the frame edge instead of squashing the shape.
     pub fn dragged(&self, grab: Grab, dx: i64, dy: i64, w: usize, h: usize) -> Shape {
-        let (max_x, max_y) = (w as i64 - 1, h as i64 - 1);
+        let (max_x, max_y) = (w.saturating_sub(1) as i64, h.saturating_sub(1) as i64);
+        // A shape kept from a larger image (another camera, a turned recording) may reach
+        // outside this one: bring it in first, or the limits below would cross.
+        let inside = |(x, y): (usize, usize)| (x.min(max_x as usize), y.min(max_y as usize));
+        let this = Shape {
+            a: inside(self.a),
+            b: inside(self.b),
+            ..*self
+        };
+        let this = &this;
         let (mut dx, mut dy) = (dx, dy);
         if grab == Grab::MOVE {
-            let (x0, x1) = (self.a.0.min(self.b.0) as i64, self.a.0.max(self.b.0) as i64);
-            let (y0, y1) = (self.a.1.min(self.b.1) as i64, self.a.1.max(self.b.1) as i64);
+            let (x0, x1) = (this.a.0.min(this.b.0) as i64, this.a.0.max(this.b.0) as i64);
+            let (y0, y1) = (this.a.1.min(this.b.1) as i64, this.a.1.max(this.b.1) as i64);
             dx = dx.clamp(-x0, max_x - x1);
             dy = dy.clamp(-y0, max_y - y1);
         }
@@ -201,12 +233,12 @@ impl Shape {
         };
         Shape {
             a: (
-                shift(self.a.0, grab.ax, dx, max_x),
-                shift(self.a.1, grab.ay, dy, max_y),
+                shift(this.a.0, grab.ax, dx, max_x),
+                shift(this.a.1, grab.ay, dy, max_y),
             ),
             b: (
-                shift(self.b.0, grab.bx, dx, max_x),
-                shift(self.b.1, grab.by, dy, max_y),
+                shift(this.b.0, grab.bx, dx, max_x),
+                shift(this.b.1, grab.by, dy, max_y),
             ),
             ..*self
         }
@@ -437,6 +469,32 @@ mod tests {
         // moving one end leaves the other alone and clamps
         let e = l.dragged(Grab::END_B, 500, 3, 160, 120);
         assert_eq!((e.a, e.b), ((5, 5), (159, 63)));
+    }
+
+    /// A shape drawn on a larger image (P3, 256×192) and then moved on a smaller one (Lepton,
+    /// or a turned recording): it comes inside instead of panicking.
+    #[test]
+    fn dragging_a_shape_larger_than_the_frame() {
+        let l = Shape {
+            id: 1,
+            kind: ShapeKind::Line,
+            a: (10, 10),
+            b: (250, 180),
+        };
+        let m = l.dragged(Grab::MOVE, 3, 3, 160, 120);
+        assert_eq!((m.a, m.b), ((10, 10), (159, 119)));
+        let m = l.dragged(Grab::MOVE, -3, -4, 160, 120);
+        assert_eq!((m.a, m.b), ((7, 6), (156, 115)));
+        let b = Shape {
+            id: 2,
+            kind: ShapeKind::Box,
+            a: (200, 150),
+            b: (255, 191),
+        };
+        let m = b.dragged(Grab::MOVE, -5, 0, 160, 120);
+        assert_eq!((m.a, m.b), ((154, 119), (154, 119)));
+        let st = b.stats(&ramp()).unwrap();
+        assert_eq!((st.pixels, st.max_pos), (1, (3, 2)));
     }
 
     #[test]

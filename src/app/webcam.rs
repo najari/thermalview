@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use eframe::egui::{self, Color32};
 
-use super::ThermalApp;
+use super::{Hold, ThermalApp};
 use crate::webcam::align::{self, Found};
 use crate::webcam::blend::{Alignment, Mode, Overlay};
 use crate::webcam::{self, Device, Picture, State, Webcam};
@@ -26,12 +26,27 @@ pub(super) struct WebcamState {
     aligning: Option<Receiver<Option<Found>>>,
     /// Outcome of the last automatic alignment, for the panel.
     align_note: Option<(bool, String)>,
+    /// The camera's current failure has been shown in the status line.
+    failure_shown: bool,
+    /// The picture that goes with a frozen thermal image.
+    held: Option<Arc<Picture>>,
 }
 
 impl WebcamState {
     pub(super) fn stop(&mut self) {
         self.cam = None;
     }
+}
+
+/// The thermal image is being frozen: keep the webcam picture of the same moment with it,
+/// instead of mixing a still thermal image with moving video. Call before the hold is set.
+pub(super) fn hold(app: &mut ThermalApp) {
+    app.webcam.held = layer(app).map(|(pic, _)| pic);
+}
+
+/// The hold ended, or a file took the place of the frozen image.
+pub(super) fn release(app: &mut ThermalApp) {
+    app.webcam.held = None;
 }
 
 /// Open or close the camera to match the settings, and collect a finished device listing.
@@ -48,6 +63,16 @@ pub(super) fn sync(app: &mut ThermalApp, ctx: &egui::Context) {
             let ctx = ctx.clone();
             app.webcam.cam = Some(Webcam::open(&link, move || ctx.request_repaint()));
         }
+    }
+    // A webcam that fails or drops out is told in the status line too: the panel section that
+    // shows it may be folded or scrolled away.
+    match app.webcam.cam.as_ref().map(Webcam::state) {
+        Some(State::Failed(e)) if !app.webcam.failure_shown => {
+            app.webcam.failure_shown = true;
+            app.notify(format!("웹캠: {e}"));
+        }
+        Some(State::Failed(_)) => {}
+        _ => app.webcam.failure_shown = false,
     }
     if let Some(rx) = &app.webcam.aligning {
         match rx.try_recv() {
@@ -203,6 +228,15 @@ pub(super) fn layer(app: &ThermalApp) -> Option<(Arc<Picture>, Overlay)> {
     if app.player.is_some() || !app.settings.webcam.enabled {
         return None;
     }
+    match &app.hold {
+        // A frozen image keeps the picture taken with it; a reopened snapshot has none.
+        Some(Hold::Frozen) => {
+            let pic = app.webcam.held.clone()?;
+            return Some((pic, app.settings.webcam.overlay));
+        }
+        Some(Hold::Snapshot(_)) => return None,
+        None => {}
+    }
     let cam = app.webcam.cam.as_ref()?;
     if !matches!(cam.state(), State::Running { .. }) {
         return None;
@@ -267,9 +301,28 @@ fn percent(v: f64) -> String {
     format!("{:.0}%", v * 100.0)
 }
 
+/// What the user types into a percent field ("50" or "50%") as the 0..1 value behind it.
+fn parse_percent(s: &str) -> Option<f64> {
+    let v: f64 = s.trim().trim_end_matches('%').trim().parse().ok()?;
+    Some(v / 100.0)
+}
+
 /// Settings panel section.
+/// One-line state for the header of the panel section.
+pub(super) fn summary(app: &ThermalApp) -> String {
+    let s = &app.settings.webcam;
+    if !s.enabled {
+        return "꺼짐".into();
+    }
+    match app.webcam.cam.as_ref().map(Webcam::state) {
+        Some(State::Running { .. }) => s.overlay.mode.label().into(),
+        Some(State::Opening) => "연결 중".into(),
+        Some(State::Failed(_)) => "오류".into(),
+        None => "장치 선택 필요".into(),
+    }
+}
+
 pub(super) fn controls(ui: &mut egui::Ui, app: &mut ThermalApp) {
-    ui.heading("웹캠 합성");
     let before = app.settings.webcam.clone();
     let mut refresh = app.webcam.devices.is_none()
         && app.webcam.listing.is_none()
@@ -353,7 +406,8 @@ pub(super) fn controls(ui: &mut egui::Ui, app: &mut ThermalApp) {
     ui.add(
         egui::Slider::new(value, 0.0..=1.0)
             .text(text)
-            .custom_formatter(|v, _| percent(v)),
+            .custom_formatter(|v, _| percent(v))
+            .custom_parser(parse_percent),
     );
     ui.label("정렬");
     let a = &mut ov.align;
@@ -361,19 +415,23 @@ pub(super) fn controls(ui: &mut egui::Ui, app: &mut ThermalApp) {
         egui::Slider::new(&mut a.scale, Alignment::SCALE)
             .text("크기")
             .step_by(0.01)
-            .custom_formatter(|v, _| format!("{v:.2}배")),
+            .custom_formatter(|v, _| format!("{v:.2}배"))
+            .custom_parser(|s| s.trim().trim_end_matches('배').trim().parse().ok()),
     );
+    // One decimal: the steps are 0.2 % of the image.
     ui.add(
         egui::Slider::new(&mut a.dx, Alignment::SHIFT)
             .text("가로 위치")
             .step_by(0.002)
-            .custom_formatter(|v, _| percent(v)),
+            .custom_formatter(|v, _| format!("{:.1}%", v * 100.0))
+            .custom_parser(parse_percent),
     );
     ui.add(
         egui::Slider::new(&mut a.dy, Alignment::SHIFT)
             .text("세로 위치")
             .step_by(0.002)
-            .custom_formatter(|v, _| percent(v)),
+            .custom_formatter(|v, _| format!("{:.1}%", v * 100.0))
+            .custom_parser(parse_percent),
     );
     let mut auto = false;
     ui.horizontal(|ui| {
@@ -408,6 +466,10 @@ pub(super) fn controls(ui: &mut egui::Ui, app: &mut ThermalApp) {
 
     if app.settings.webcam != before {
         app.mark_dirty();
+    }
+    // "Aligned" no longer describes an alignment changed by hand.
+    if app.settings.webcam.overlay.align != before.overlay.align {
+        app.webcam.align_note = None;
     }
     if auto {
         start_auto_align(app, ui.ctx());
@@ -572,6 +634,23 @@ mod tests {
         app.open_sequence(&seq);
         assert!(layer(&app).is_none());
         assert!(app.video_scene(0.0).unwrap().webcam.is_none());
+
+        // A frozen image keeps the webcam picture of that moment; a reopened snapshot has none.
+        app.close_player();
+        app.camera.inject(crate::thermal::frame::ThermalFrame::new(
+            160,
+            120,
+            vec![30000; 160 * 120],
+            Some(0.01),
+        ));
+        app.tick(&egui::Context::default());
+        app.set_hold(true).unwrap();
+        let held = app.webcam.held.clone().expect("picture kept");
+        assert!(Arc::ptr_eq(&layer(&app).unwrap().0, &held));
+        app.set_hold(false).unwrap();
+        assert!(app.webcam.held.is_none() && layer(&app).is_some());
+        app.open_snapshot(&png);
+        assert!(app.hold.is_some() && layer(&app).is_none());
         std::fs::remove_dir_all(&dir).ok();
     }
 }

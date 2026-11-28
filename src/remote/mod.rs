@@ -6,6 +6,7 @@
 
 pub mod server;
 
+use crate::thermal::filter::Temporal;
 use crate::thermal::palette::Palette;
 use crate::thermal::rotate::Rotation;
 
@@ -16,7 +17,27 @@ pub const DEFAULT_PORT: u16 = 7700;
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum RangeSet {
     Auto,
-    Manual { lo: f32, hi: f32 },
+    /// Automatic without the coldest and hottest pixels.
+    Robust,
+    Manual {
+        lo: f32,
+        hi: f32,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum IsoSet {
+    Off,
+    Above(f32),
+    Below(f32),
+    Between(f32, f32),
+}
+
+/// Magnification of the image view, optionally centered on a pixel.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ZoomSet {
+    pub factor: f32,
+    pub center: Option<(usize, usize)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -52,13 +73,22 @@ pub enum Request {
     Frame,
     /// Line up the webcam picture with the thermal image automatically.
     Align,
+    /// Hold the current image (incoming frames are dropped) or go back to live video.
+    Freeze(Option<bool>),
+    Isotherm(Option<IsoSet>),
+    /// Strength of the temporal noise filter (1 = off).
+    Filter(Option<u8>),
+    Zoom(Option<ZoomSet>),
+    /// Save a picture of the whole window as it is drawn.
+    Screenshot,
     /// Close the connection (answered by the connection thread).
     Quit,
 }
 
 pub const HELP: &str = "commands: STATUS | MEAS | TEMP x y | SPOT [LIST|ADD x y|DEL id|CLEAR] | \
-PALETTE [name] | RANGE [AUTO|lo hi] | ROTATE [0|90|180|270] | EMISSIVITY [e] | ALARMS | SNAPSHOT | CSV START|STOP | \
-REC START|STOP | MP4 START|STOP | FRAME | ALIGN | QUIT";
+PALETTE [name] | RANGE [AUTO|ROBUST|lo hi] | ISOTHERM [OFF|ABOVE t|BELOW t|BETWEEN lo hi] | \
+FILTER [1|2|4|8|16] | ROTATE [0|90|180|270] | EMISSIVITY [e] | ALARMS | FREEZE [ON|OFF] | ZOOM [factor [x y]] | \
+SNAPSHOT | CSV START|STOP | REC START|STOP | MP4 START|STOP | FRAME | ALIGN | SCREENSHOT | QUIT";
 
 /// Parse one command line (case-insensitive, words separated by spaces).
 pub fn parse(line: &str) -> Result<Request, String> {
@@ -86,6 +116,38 @@ pub fn parse(line: &str) -> Result<Request, String> {
         ["PALETTE", name] => Request::Palette(Some(palette(name)?)),
         ["RANGE"] => Request::Range(None),
         ["RANGE", "AUTO"] => Request::Range(Some(RangeSet::Auto)),
+        ["RANGE", "ROBUST"] => Request::Range(Some(RangeSet::Robust)),
+        ["ISOTHERM"] => Request::Isotherm(None),
+        ["ISOTHERM", "OFF"] => Request::Isotherm(Some(IsoSet::Off)),
+        ["ISOTHERM", "ABOVE", t] => Request::Isotherm(Some(IsoSet::Above(number(t)?))),
+        ["ISOTHERM", "BELOW", t] => Request::Isotherm(Some(IsoSet::Below(number(t)?))),
+        ["ISOTHERM", "BETWEEN", lo, hi] => {
+            let (lo, hi) = (number(lo)?, number(hi)?);
+            if lo >= hi {
+                return Err("isotherm: lo must be below hi".into());
+            }
+            Request::Isotherm(Some(IsoSet::Between(lo, hi)))
+        }
+        ["FILTER"] => Request::Filter(None),
+        ["FILTER", "OFF"] => Request::Filter(Some(1)),
+        ["FILTER", n] => Request::Filter(Some(
+            n.parse()
+                .ok()
+                .filter(|n| Temporal::STRENGTHS.contains(n))
+                .ok_or_else(|| format!("filter {n}: use 1 (off), 2, 4, 8 or 16"))?,
+        )),
+        ["FREEZE"] => Request::Freeze(None),
+        ["FREEZE", "ON"] => Request::Freeze(Some(true)),
+        ["FREEZE", "OFF"] => Request::Freeze(Some(false)),
+        ["ZOOM"] => Request::Zoom(None),
+        ["ZOOM", z] => Request::Zoom(Some(ZoomSet {
+            factor: zoom(z)?,
+            center: None,
+        })),
+        ["ZOOM", z, x, y] => Request::Zoom(Some(ZoomSet {
+            factor: zoom(z)?,
+            center: Some((pixel(x)?, pixel(y)?)),
+        })),
         ["RANGE", lo, hi] => {
             let (lo, hi) = (number(lo)?, number(hi)?);
             if lo >= hi {
@@ -107,6 +169,7 @@ pub fn parse(line: &str) -> Result<Request, String> {
         ["MP4", "STOP"] => Request::Video(false),
         ["FRAME"] => Request::Frame,
         ["ALIGN"] => Request::Align,
+        ["SCREENSHOT"] => Request::Screenshot,
         ["QUIT" | "EXIT"] => Request::Quit,
         [] => return Err("empty command".into()),
         [cmd, ..] => {
@@ -118,6 +181,10 @@ pub fn parse(line: &str) -> Result<Request, String> {
                 "SPOT",
                 "PALETTE",
                 "RANGE",
+                "ISOTHERM",
+                "FILTER",
+                "FREEZE",
+                "ZOOM",
                 "ROTATE",
                 "EMISSIVITY",
                 "ALARMS",
@@ -127,6 +194,7 @@ pub fn parse(line: &str) -> Result<Request, String> {
                 "MP4",
                 "FRAME",
                 "ALIGN",
+                "SCREENSHOT",
                 "QUIT",
             ];
             return Err(if known.contains(cmd) {
@@ -154,6 +222,16 @@ fn rotation(s: &str) -> Result<Rotation, String> {
         .into_iter()
         .find(|r| s.parse() == Ok(rotation_degrees(*r)))
         .ok_or_else(|| format!("rotation {s}: use 0, 90, 180 or 270"))
+}
+
+/// Largest magnification of the image view.
+pub const MAX_ZOOM: f32 = 8.0;
+
+fn zoom(s: &str) -> Result<f32, String> {
+    number(s)
+        .ok()
+        .filter(|z| (1.0..=MAX_ZOOM).contains(z))
+        .ok_or_else(|| format!("zoom {s}: use 1 to {MAX_ZOOM}"))
 }
 
 fn pixel(s: &str) -> Result<usize, String> {
@@ -272,6 +350,40 @@ mod tests {
         assert!(parse("ROTATE 45").unwrap_err().contains("270"));
         assert!(parse("FFC").unwrap_err().starts_with("unknown command"));
         assert!(parse("CSV").unwrap_err().starts_with("bad arguments"));
+    }
+
+    #[test]
+    fn view_commands() {
+        assert_eq!(
+            parse("range robust"),
+            Ok(Request::Range(Some(RangeSet::Robust)))
+        );
+        assert_eq!(parse("ISOTHERM"), Ok(Request::Isotherm(None)));
+        assert_eq!(
+            parse("isotherm above 60"),
+            Ok(Request::Isotherm(Some(IsoSet::Above(60.0))))
+        );
+        assert_eq!(
+            parse("isotherm between 30 35.5"),
+            Ok(Request::Isotherm(Some(IsoSet::Between(30.0, 35.5))))
+        );
+        assert!(parse("ISOTHERM BETWEEN 40 30").is_err());
+        assert_eq!(
+            parse("isotherm off"),
+            Ok(Request::Isotherm(Some(IsoSet::Off)))
+        );
+        assert_eq!(parse("filter 8"), Ok(Request::Filter(Some(8))));
+        assert_eq!(parse("filter off"), Ok(Request::Filter(Some(1))));
+        assert!(parse("FILTER 3").unwrap_err().contains("16"));
+        assert_eq!(parse("freeze on"), Ok(Request::Freeze(Some(true))));
+        assert_eq!(parse("FREEZE"), Ok(Request::Freeze(None)));
+        assert!(parse("FREEZE NOW")
+            .unwrap_err()
+            .starts_with("bad arguments"));
+        let zoom = |factor, center| Ok(Request::Zoom(Some(ZoomSet { factor, center })));
+        assert_eq!(parse("zoom 2.5"), zoom(2.5, None));
+        assert_eq!(parse("zoom 4 100 60"), zoom(4.0, Some((100, 60))));
+        assert!(parse("ZOOM 0.5").is_err() && parse("ZOOM 9").is_err());
     }
 
     #[test]

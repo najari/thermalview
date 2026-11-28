@@ -21,6 +21,10 @@ pub struct CsvLog {
 
 #[derive(Debug, Clone, Copy)]
 pub struct Row<'a> {
+    /// When the frame arrived; `None` (a played-back frame) logs the time of writing. Frames
+    /// that waited in the queue are written in a burst, so the writing time would give
+    /// several rows the same time.
+    pub captured: Option<std::time::SystemTime>,
     pub sequence: u32,
     pub max: f32,
     pub min: f32,
@@ -81,7 +85,10 @@ impl CsvLog {
     }
 
     pub fn write(&mut self, r: Row<'_>) -> anyhow::Result<()> {
-        let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
+        let when = r
+            .captured
+            .map_or_else(chrono::Local::now, chrono::DateTime::<chrono::Local>::from);
+        let now = when.format("%Y-%m-%d %H:%M:%S%.3f");
         write!(
             self.out,
             "{now},{},{:.2},{:.2},{:.2},{:.2},",
@@ -135,6 +142,7 @@ mod tests {
             pixels: 4,
         };
         log.write(Row {
+            captured: None,
             sequence: 7,
             max: 40.0,
             min: 20.0,

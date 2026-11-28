@@ -6,7 +6,7 @@ use std::time::SystemTime;
 use super::ThermalApp;
 use crate::thermal::shapes::ShapeKind;
 use crate::thermal::upscale::FACTOR;
-use crate::video::overlay::{Mark, Scene, WebcamLayer, MAX_COLOR, MIN_COLOR};
+use crate::video::overlay::{BandMark, Mark, Scene, WebcamLayer, MAX_COLOR, MIN_COLOR};
 use crate::video::Mp4Writer;
 
 impl ThermalApp {
@@ -24,6 +24,7 @@ impl ThermalApp {
         if self.video.is_some() {
             return Err("already recording MP4".into());
         }
+        self.check_not_held()?;
         let Some(f) = &self.frame else {
             return Err("no frame yet".into());
         };
@@ -44,13 +45,18 @@ impl ThermalApp {
     /// Finish the MP4; returns its path and frame count.
     pub(super) fn stop_video(&mut self) -> Result<(PathBuf, u64), String> {
         let w = self.video.take().ok_or("not recording MP4")?;
+        let skipped = w.skipped();
         match w.finish() {
             Ok((_, 0)) => {
                 self.notify("MP4 녹화 종료: 기록된 프레임이 없어 파일을 만들지 않았습니다");
                 Err("no frames were recorded; no file written".into())
             }
             Ok((path, n)) => {
-                self.notify(format!("MP4 녹화 종료: {n}프레임 → {}", path.display()));
+                let mut msg = format!("MP4 녹화 종료: {n}프레임 → {}", path.display());
+                if skipped > 0 {
+                    msg.push_str(&format!(" (인코딩이 밀려 {skipped}프레임 건너뜀)"));
+                }
+                self.notify(msg);
                 Ok((path, n))
             }
             Err(e) => {
@@ -69,6 +75,10 @@ impl ThermalApp {
             return;
         };
         if (scene.width, scene.height) != w.size() {
+            // One file holds one image size (another camera took over, or another recording
+            // was opened): end it rather than record nothing while the timer runs.
+            let _ = self.stop_video();
+            self.notify("영상 크기가 바뀌어 MP4 녹화를 끝냈습니다");
             return;
         }
         let ok = self.video.as_mut().is_some_and(|w| w.push(t, scene));
@@ -110,10 +120,13 @@ impl ThermalApp {
             });
         }
         for s in &self.settings.shapes.items {
-            let text = s
-                .stats(f)
+            let stats = s.stats(f);
+            let text = stats
                 .map(|st| format!("{} ↑{:.1} ~{:.1}{unit}", s.label(), st.max, st.mean))
                 .unwrap_or_default();
+            if let Some(st) = stats.filter(|st| s.kind == ShapeKind::Box && st.pixels > 1) {
+                marks.push(Mark::Peak { at: st.max_pos });
+            }
             marks.push(match s.kind {
                 ShapeKind::Box => Mark::Box {
                     a: s.a,
@@ -150,6 +163,11 @@ impl ThermalApp {
             rgba: self.rgba.clone(),
             lut: self.lut.1.to_vec(),
             range: self.display_range,
+            band: self.settings.isotherm.limits().map(|(lo, hi)| BandMark {
+                lo,
+                hi,
+                color: self.settings.isotherm.color,
+            }),
             unit,
             caption,
             marks,

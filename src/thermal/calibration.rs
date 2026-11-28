@@ -240,6 +240,34 @@ impl Calibration {
         Ok(())
     }
 
+    /// Make values read from a settings file safe to use, with the limits the UI enforces: a
+    /// hand-edited or damaged file could otherwise give two references a zero span (division
+    /// by zero, every temperature NaN). Returns true if anything was changed.
+    pub fn sanitize(&mut self) -> bool {
+        let before = self.clone();
+        if !self.emissivity.is_finite() {
+            self.emissivity = 1.0;
+        }
+        self.emissivity = self.emissivity.clamp(MIN_EMISSIVITY, 1.0);
+        if !self.reflected_c.is_finite() {
+            self.reflected_c = 20.0;
+        }
+        self.refs.truncate(MAX_REFS);
+        self.refs.retain(|p| {
+            p.measured_c.is_finite()
+                && p.expected_c.is_finite()
+                && (p.expected_c - p.measured_c).abs() <= MAX_REF_OFFSET_C
+        });
+        if let [p, q] = self.refs.as_slice() {
+            let span = q.measured_c - p.measured_c;
+            let gain = (q.expected_c - p.expected_c) / span;
+            if span.abs() < MIN_REF_SPAN_C || !(GAIN_LIMITS.0..=GAIN_LIMITS.1).contains(&gain) {
+                self.refs.truncate(1);
+            }
+        }
+        *self != before
+    }
+
     /// One-line description for the UI and logs.
     pub fn summary(&self) -> String {
         let mut parts = Vec::new();
@@ -375,6 +403,23 @@ mod tests {
         let (g, _) = c.linear();
         assert!((g - 100.0 / 98.5).abs() < 1e-4);
         assert_eq!(c.add_ref(50.0, 50.0), Err(RefError::Full));
+    }
+
+    #[test]
+    fn sanitize_keeps_good_values_and_drops_unusable_ones() {
+        let mut c = Calibration::default();
+        assert!(!c.sanitize());
+        c.add_ref(30.0, 31.0).unwrap();
+        c.add_ref(60.0, 62.0).unwrap();
+        c.emissivity = 0.95;
+        assert!(!c.sanitize(), "valid settings stay as they are");
+        // A hand-edited file: two references with the same reading, emissivity not a number.
+        c.refs[1].measured_c = c.refs[0].measured_c;
+        c.emissivity = f32::NAN;
+        assert!(c.sanitize());
+        assert_eq!(c.refs.len(), 1);
+        assert_eq!(c.emissivity, 1.0);
+        assert!(c.object_c(30.0).is_finite());
     }
 
     #[test]

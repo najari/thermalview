@@ -85,6 +85,38 @@ impl Palette {
         }
         lut
     }
+
+    /// The table, or the same table hot end first.
+    pub fn lut_of(self, inverted: bool) -> [[u8; 3]; 256] {
+        let mut lut = self.lut();
+        if inverted {
+            lut.reverse();
+        }
+        lut
+    }
+}
+
+/// Paint the pixels whose raw value lies in `lo..=hi` in one color, over an image made by
+/// [`colorize`] (an isotherm). Returns how many pixels were painted.
+pub fn paint_band(raw: &[u16], lo: u16, hi: u16, color: [u8; 3], rgba: &mut [u8]) -> usize {
+    let mut painted = 0;
+    for (&v, px) in raw.iter().zip(rgba.as_chunks_mut::<4>().0) {
+        if (lo..=hi).contains(&v) {
+            px[..3].copy_from_slice(&color);
+            painted += 1;
+        }
+    }
+    painted
+}
+
+/// [`paint_band`] for fractional raw values (an upscaled image).
+pub fn paint_band_f32(raw: &[f32], lo: u16, hi: u16, color: [u8; 3], rgba: &mut [u8]) {
+    let (lo, hi) = (lo as f32, hi as f32);
+    for (&v, px) in raw.iter().zip(rgba.as_chunks_mut::<4>().0) {
+        if v >= lo && v <= hi {
+            px[..3].copy_from_slice(&color);
+        }
+    }
 }
 
 /// Map raw values to RGBA through `lut`, with `lo..=hi` (raw units) spread over the table.
@@ -125,6 +157,35 @@ mod tests {
         let f: Vec<f32> = raw.iter().map(|&v| v as f32).collect();
         colorize_f32(&f, 100, 200, &lut, &mut b);
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn band_is_painted_over_both_kinds_of_image() {
+        let lut = Palette::WhiteHot.lut();
+        let raw = [90u16, 100, 150, 200, 210];
+        let mut rgba = Vec::new();
+        colorize(&raw, 0, 255, &lut, &mut rgba);
+        let green = [0, 255, 0];
+        assert_eq!(paint_band(&raw, 100, 200, green, &mut rgba), 3);
+        let px: Vec<[u8; 4]> = rgba.as_chunks::<4>().0.to_vec();
+        assert_eq!(px[0], [90, 90, 90, 255]);
+        assert_eq!(px[1], [0, 255, 0, 255]);
+        assert_eq!(px[3], [0, 255, 0, 255]);
+        assert_eq!(px[4], [210, 210, 210, 255]);
+
+        let f: Vec<f32> = vec![99.4, 100.0, 200.0, 200.6];
+        let mut up = vec![7u8; 16];
+        paint_band_f32(&f, 100, 200, green, &mut up);
+        let px: Vec<[u8; 4]> = up.as_chunks::<4>().0.to_vec();
+        assert_eq!(px, [[7; 4], [0, 255, 0, 7], [0, 255, 0, 7], [7; 4]]);
+    }
+
+    #[test]
+    fn inverted_table_runs_backwards() {
+        let (lut, inv) = (Palette::Ironbow.lut(), Palette::Ironbow.lut_of(true));
+        assert_eq!(inv[0], lut[255]);
+        assert_eq!(inv[200], lut[55]);
+        assert_eq!(Palette::Ironbow.lut_of(false), lut);
     }
 
     #[test]

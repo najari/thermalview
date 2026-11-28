@@ -2,9 +2,12 @@
 
 pub mod alarm;
 pub mod calibration;
+pub mod delta;
+pub mod filter;
 pub mod frame;
 pub mod histogram;
 pub mod history;
+pub mod isotherm;
 pub mod measure;
 pub mod palette;
 pub mod range;

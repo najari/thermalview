@@ -67,7 +67,7 @@ fn main() -> anyhow::Result<()> {
         );
         let v = thermal[(ty as usize).min(th - 1) * tw + (tx as usize).min(tw - 1)];
         let g = ((v - lo) / (hi - lo).max(1.0) * 255.0) as u8;
-        let s = blend::sample(&pic, place, tx, ty);
+        let s = blend::sample(&pic, place, tx, ty, overlay.mode);
         px.0 = blend::mix(&overlay, [g, g / 2, 0], s);
     }
     out.save(&args[3])?;
