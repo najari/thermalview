@@ -69,6 +69,8 @@ pub struct Scene {
     pub lut: Vec<Rgb>,
     /// Temperatures at the bottom and top of the color bar.
     pub range: (f32, f32),
+    /// The bar shows differences: its labels carry a sign.
+    pub signed: bool,
     /// Isotherm in use; its pixels are already painted in `rgba`.
     pub band: Option<BandMark>,
     pub unit: &'static str,
@@ -425,7 +427,10 @@ pub fn compose(scene: &Scene, text: &Text) -> Canvas {
         let v = hi - (hi - lo) * t;
         let y = (t * (ih - 1) as f32).round() as i32;
         cv.fill(bx + bar_w, y, bx + bar_w + 4, y + 1, WHITE);
-        let s = format!("{v:.1}{}", scene.unit);
+        let s = match scene.signed {
+            true => format!("{v:+.1}{}", scene.unit),
+            false => format!("{v:.1}{}", scene.unit),
+        };
         let (_, h) = text.size(&s);
         let ty = (y - h / 2).clamp(0, ih as i32 - h);
         text.draw(&mut cv, bx + bar_w + 6, ty, &s, WHITE);
@@ -437,21 +442,118 @@ pub fn compose(scene: &Scene, text: &Text) -> Canvas {
     cv
 }
 
+/// One axis of a bilinear lookup into the webcam picture: the two picture pixels around an
+/// output pixel and the weight of the second, 0..=[`UNIT`].
+type Tap = Option<(usize, usize, u32)>;
+
+/// Weight 1 of a tap. Twelve bits: the mixed color is then within one level of the plain
+/// floating-point result, and a sum of four weighted bytes still fits 32 bits.
+const UNIT: u32 = 4096;
+
+/// The taps of `n` output pixels along one axis. The picture spans `lo..hi` in thermal pixel
+/// units and is `size` pixels long. `None` where the picture does not reach. Same positions as
+/// [`blend::sample`] and `Picture::color_at`.
+fn taps(n: usize, lo: f32, hi: f32, size: usize) -> Vec<Tap> {
+    (0..n)
+        .map(|i| {
+            let t = (i as f32 + 0.5) / SCALE as f32;
+            let u = (t - lo) / (hi - lo) * size as f32;
+            if !(u >= 0.0 && u < size as f32) {
+                return None;
+            }
+            let f = (u - 0.5).max(0.0);
+            let a = (f as usize).min(size - 1);
+            let b = (a + 1).min(size - 1);
+            Some((a, b, ((f - a as f32) * UNIT as f32).round() as u32))
+        })
+        .collect()
+}
+
 /// Mix the webcam picture into the enlarged thermal image, as the screen does.
+///
+/// This runs for every pixel of every video frame (786,432 of them for a P3 image), so it works
+/// in whole numbers with the lookups of each column and row prepared once: the plain version
+/// ([`blend::sample`] and [`blend::mix`] per pixel, kept as the reference in the tests) took
+/// longer than the time between two frames.
 fn mix_webcam(cv: &mut Canvas, scene: &Scene, layer: &WebcamLayer) {
     let pic = &layer.picture;
-    let place = layer
+    let (pw, ph) = (pic.width, pic.height);
+    let [x0, y0, x1, y1] = layer
         .overlay
         .align
-        .placement((scene.width, scene.height), (pic.width, pic.height));
-    for y in 0..scene.height * SCALE {
-        let ty = (y as f32 + 0.5) / SCALE as f32;
-        for x in 0..scene.width * SCALE {
-            let tx = (x as f32 + 0.5) / SCALE as f32;
-            let thermal = cv.get(x, y);
-            let cam = blend::sample(pic, place, tx, ty, layer.overlay.mode);
-            let i = (y * cv.width + x) * 3;
-            cv.rgb[i..i + 3].copy_from_slice(&blend::mix(&layer.overlay, thermal, cam));
+        .placement((scene.width, scene.height), (pw, ph));
+    let (iw, ih) = (scene.width * SCALE, scene.height * SCALE);
+    let usable = x1 > x0 && y1 > y0 && pic.rgba.len() == pw * ph * 4 && pic.edges.len() == pw * ph;
+    let (cols, rows) = if usable {
+        (taps(iw, x0, x1, pw), taps(ih, y0, y1, ph))
+    } else {
+        (vec![None; iw], vec![None; ih])
+    };
+    // Opacity as 0..=256.
+    let a = (layer.overlay.strength() * 256.0).round() as u64;
+    let mode = layer.overlay.mode;
+    let stride = cv.width * 3;
+    for (y, row) in rows.iter().enumerate() {
+        let line = &mut cv.rgb[y * stride..][..iw * 3];
+        let pixels = line.as_chunks_mut::<3>().0.iter_mut().zip(&cols);
+        match (mode, *row) {
+            // No webcam picture on this row: black behind the thermal image, as on screen.
+            (blend::Mode::Blend, None) => {
+                for (px, _) in pixels {
+                    for c in px {
+                        *c = ((*c as u64 * a + 128) >> 8) as u8;
+                    }
+                }
+            }
+            (blend::Mode::Blend, Some((ya, yb, wy))) => {
+                let (top, bottom) = (&pic.rgba[ya * pw * 4..], &pic.rgba[yb * pw * 4..]);
+                for (px, col) in pixels {
+                    let Some((xa, xb, wx)) = *col else {
+                        for c in px {
+                            *c = ((*c as u64 * a + 128) >> 8) as u8;
+                        }
+                        continue;
+                    };
+                    let w = [
+                        (UNIT - wx) * (UNIT - wy),
+                        wx * (UNIT - wy),
+                        (UNIT - wx) * wy,
+                        wx * wy,
+                    ];
+                    for (k, c) in px.iter_mut().enumerate() {
+                        // The picture's color here, times UNIT².
+                        let cam = top[xa * 4 + k] as u32 * w[0]
+                            + top[xb * 4 + k] as u32 * w[1]
+                            + bottom[xa * 4 + k] as u32 * w[2]
+                            + bottom[xb * 4 + k] as u32 * w[3];
+                        let mixed = cam as u64 * (256 - a) + ((*c as u64) << 24) * a;
+                        *c = ((mixed + (1 << 31)) >> 32) as u8;
+                    }
+                }
+            }
+            (blend::Mode::Edges, None) => {}
+            (blend::Mode::Edges, Some((ya, yb, wy))) => {
+                let (top, bottom) = (&pic.edges[ya * pw..], &pic.edges[yb * pw..]);
+                // Full edge strength at full opacity.
+                const ONE: u64 = 255 * (UNIT as u64 * UNIT as u64) * 256;
+                for (px, col) in pixels {
+                    let Some((xa, xb, wx)) = *col else {
+                        continue;
+                    };
+                    let edge = top[xa] as u32 * ((UNIT - wx) * (UNIT - wy))
+                        + top[xb] as u32 * (wx * (UNIT - wy))
+                        + bottom[xa] as u32 * ((UNIT - wx) * wy)
+                        + bottom[xb] as u32 * (wx * wy);
+                    if edge == 0 {
+                        continue;
+                    }
+                    let strength = edge as u64 * a;
+                    for c in px {
+                        let lift = (255 - *c as u64) * strength;
+                        *c += ((lift + ONE / 2) / ONE) as u8;
+                    }
+                }
+            }
         }
     }
 }
@@ -499,6 +601,7 @@ mod tests {
             rgba,
             lut: (0..=255u8).map(|v| [v, v, v]).collect(),
             range: (20.0, 40.0),
+            signed: false,
             band: None,
             unit: "°C",
             caption: "2026-11-25 10:00:00".into(),
@@ -529,6 +632,159 @@ mod tests {
         let x = 640 + 12 + 8;
         assert_eq!(cv.get(x, 0), [255, 255, 255]);
         assert_eq!(cv.get(x, 479), [0, 0, 0]);
+    }
+
+    /// Not a check: prints what one video frame costs to draw and convert, for a P3 image with
+    /// the 4× picture and the webcam mixed in.
+    /// `cargo test --release -- --ignored --nocapture frame_cost`
+    #[test]
+    #[ignore]
+    fn frame_cost() {
+        let (w, h) = (256, 192);
+        let noise = |n: usize| -> Vec<u8> { (0..n).map(|i| (i * 7919 % 251) as u8).collect() };
+        let picture = Arc::new(Picture::new(1, 640, 480, noise(640 * 480 * 4)));
+        let mut s = Scene {
+            width: w,
+            height: h,
+            rgba: noise(w * h * 4),
+            lut: (0..=255u8).map(|v| [v, v, v]).collect(),
+            range: (20.0, 40.0),
+            signed: false,
+            band: None,
+            unit: "°C",
+            caption: "2026-11-28 10:00:00".into(),
+            marks: vec![],
+            webcam: None,
+            upscaled: Some(noise(w * h * 16 * 4)),
+        };
+        let text = Text::load();
+        let mut nv12 = Vec::new();
+        let mut time = |label: &str, s: &Scene| {
+            let n = 20;
+            let t = std::time::Instant::now();
+            let mut cv = compose(s, &text);
+            for _ in 1..n {
+                cv = compose(s, &text);
+            }
+            let drawn = t.elapsed().as_secs_f64() * 1000.0 / n as f64;
+            let t = std::time::Instant::now();
+            for _ in 0..n {
+                to_nv12(&cv, &mut nv12);
+            }
+            let converted = t.elapsed().as_secs_f64() * 1000.0 / n as f64;
+            println!("{label}: compose {drawn:.1} ms, to_nv12 {converted:.1} ms");
+        };
+        time("4x image", &s);
+        for mode in [blend::Mode::Blend, blend::Mode::Edges] {
+            let overlay = Overlay {
+                mode,
+                align: blend::Alignment {
+                    scale: 1.35,
+                    dx: -0.03,
+                    dy: 0.09,
+                },
+                ..Default::default()
+            };
+            s.webcam = Some(WebcamLayer {
+                picture: picture.clone(),
+                overlay,
+            });
+            time(&format!("4x image + webcam {mode:?}"), &s);
+        }
+    }
+
+    /// The plain mixing, one [`blend::sample`] and [`blend::mix`] per pixel, that
+    /// [`mix_webcam`] must reproduce.
+    fn mix_reference(cv: &mut Canvas, scene: &Scene, layer: &WebcamLayer) {
+        let pic = &layer.picture;
+        let place = layer
+            .overlay
+            .align
+            .placement((scene.width, scene.height), (pic.width, pic.height));
+        for y in 0..scene.height * SCALE {
+            let ty = (y as f32 + 0.5) / SCALE as f32;
+            for x in 0..scene.width * SCALE {
+                let tx = (x as f32 + 0.5) / SCALE as f32;
+                let thermal = cv.get(x, y);
+                let cam = blend::sample(pic, place, tx, ty, layer.overlay.mode);
+                let i = (y * cv.width + x) * 3;
+                cv.rgb[i..i + 3].copy_from_slice(&blend::mix(&layer.overlay, thermal, cam));
+            }
+        }
+    }
+
+    #[test]
+    fn fast_webcam_mix_matches_the_plain_one() {
+        let (w, h) = (40, 30);
+        // Hard-edged blocks with noise on top: the worst case for interpolation, and plenty
+        // of edges for the edge mode.
+        let (pw, ph) = (64, 48);
+        let mut rgba = Vec::with_capacity(pw * ph * 4);
+        for i in 0..pw * ph {
+            let (x, y) = (i % pw, i / pw);
+            let block = if (x / 8 + y / 8) % 2 == 0 { 30 } else { 200 };
+            for k in 0..3 {
+                rgba.push((block + (i * 31 + k * 17) % 50) as u8);
+            }
+            rgba.push(255);
+        }
+        let picture = Arc::new(Picture::new(1, pw, ph, rgba));
+        let thermal: Vec<u8> = (0..w * h * 4).map(|i| (i * 7919 % 251) as u8).collect();
+        let mut plain = Scene {
+            width: w,
+            height: h,
+            rgba: thermal,
+            lut: vec![],
+            range: (0.0, 1.0),
+            signed: false,
+            band: None,
+            unit: "",
+            caption: String::new(),
+            marks: vec![],
+            webcam: None,
+            upscaled: None,
+        };
+        for mode in [blend::Mode::Blend, blend::Mode::Edges] {
+            // Placements that cover the image, leave a margin, and hang over its edges.
+            for (scale, dx, dy) in [(1.0, 0.0, 0.0), (0.6, 0.1, -0.2), (1.37, -0.23, 0.31)] {
+                for strength in [0.0, 0.35, 0.5, 0.8, 1.0] {
+                    let layer = WebcamLayer {
+                        picture: picture.clone(),
+                        overlay: Overlay {
+                            mode,
+                            thermal_opacity: strength,
+                            edge_strength: strength,
+                            align: blend::Alignment { scale, dx, dy },
+                        },
+                    };
+                    plain.webcam = None;
+                    let mut want = compose(&plain, &Text::none());
+                    mix_reference(&mut want, &plain, &layer);
+                    plain.webcam = Some(layer);
+                    let got = compose(&plain, &Text::none());
+                    let worst = want
+                        .rgb
+                        .iter()
+                        .zip(&got.rgb)
+                        .map(|(a, b)| a.abs_diff(*b))
+                        .max()
+                        .unwrap();
+                    assert!(
+                        worst <= 1,
+                        "{mode:?} scale {scale} strength {strength}: off by {worst}"
+                    );
+                    assert_ne!(want.rgb, vec![0; want.rgb.len()]);
+                }
+            }
+        }
+        // A picture whose buffers do not match its size is left out, not read out of bounds.
+        let mut broken = Picture::new(2, pw, ph, vec![9; pw * ph * 4]);
+        broken.rgba.truncate(100);
+        plain.webcam = Some(WebcamLayer {
+            picture: Arc::new(broken),
+            overlay: Overlay::default(),
+        });
+        compose(&plain, &Text::none());
     }
 
     #[test]

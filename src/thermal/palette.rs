@@ -64,26 +64,7 @@ impl Palette {
 
     /// Build the 256-entry RGB table.
     pub fn lut(self) -> [[u8; 3]; 256] {
-        let stops = self.stops();
-        let mut lut = [[0u8; 3]; 256];
-        for (i, entry) in lut.iter_mut().enumerate() {
-            let t = i as f32 / 255.0;
-            let k = stops
-                .windows(2)
-                .position(|w| t <= w[1].0)
-                .unwrap_or(stops.len() - 2);
-            let (t0, c0) = stops[k];
-            let (t1, c1) = stops[k + 1];
-            let f = if t1 > t0 {
-                ((t - t0) / (t1 - t0)).clamp(0.0, 1.0)
-            } else {
-                0.0
-            };
-            for ch in 0..3 {
-                entry[ch] = (c0[ch] as f32 + (c1[ch] as f32 - c0[ch] as f32) * f).round() as u8;
-            }
-        }
-        lut
+        table(self.stops())
     }
 
     /// The table, or the same table hot end first.
@@ -94,6 +75,54 @@ impl Palette {
         }
         lut
     }
+}
+
+/// Color table of a difference image: black where nothing changed, through red to yellow where
+/// it got warmer, through blue to light blue where it got colder. Entry 128 is "no change".
+pub fn difference_lut() -> [[u8; 3]; 256] {
+    table(&[
+        (0.00, [150, 220, 255]),
+        (0.25, [0, 90, 230]),
+        (0.50, [0, 0, 0]),
+        (0.75, [220, 40, 0]),
+        (1.00, [255, 235, 90]),
+    ])
+}
+
+/// Map differences (display units) to RGBA through `lut`: `-span` is its first entry, 0 its
+/// middle and `+span` its last.
+pub fn colorize_difference(diff: &[f32], span: f32, lut: &[[u8; 3]; 256], out: &mut Vec<u8>) {
+    out.clear();
+    out.reserve(diff.len() * 4);
+    let span = span.max(f32::MIN_POSITIVE);
+    for &d in diff {
+        let t = ((d / span + 1.0) / 2.0).clamp(0.0, 1.0);
+        let c = lut[(t * 255.0).round() as usize];
+        out.extend_from_slice(&[c[0], c[1], c[2], 255]);
+    }
+}
+
+/// The 256-entry table of a gradient given as (position 0..=1, color) stops.
+fn table(stops: &[(f32, [u8; 3])]) -> [[u8; 3]; 256] {
+    let mut lut = [[0u8; 3]; 256];
+    for (i, entry) in lut.iter_mut().enumerate() {
+        let t = i as f32 / 255.0;
+        let k = stops
+            .windows(2)
+            .position(|w| t <= w[1].0)
+            .unwrap_or(stops.len() - 2);
+        let (t0, c0) = stops[k];
+        let (t1, c1) = stops[k + 1];
+        let f = if t1 > t0 {
+            ((t - t0) / (t1 - t0)).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        for ch in 0..3 {
+            entry[ch] = (c0[ch] as f32 + (c1[ch] as f32 - c0[ch] as f32) * f).round() as u8;
+        }
+    }
+    lut
 }
 
 /// Paint the pixels whose raw value lies in `lo..=hi` in one color, over an image made by
@@ -178,6 +207,36 @@ mod tests {
         paint_band_f32(&f, 100, 200, green, &mut up);
         let px: Vec<[u8; 4]> = up.as_chunks::<4>().0.to_vec();
         assert_eq!(px, [[7; 4], [0, 255, 0, 7], [0, 255, 0, 7], [7; 4]]);
+    }
+
+    #[test]
+    fn difference_colors_are_centered_on_no_change() {
+        let lut = difference_lut();
+        // The table has no exact middle entry: both neighbours of it are nearly black.
+        assert!(
+            lut[127].iter().chain(&lut[128]).all(|c| *c <= 4),
+            "{:?}",
+            lut[127]
+        );
+        let mut out = Vec::new();
+        colorize_difference(&[-9.0, -2.0, 0.0, 2.0, 9.0], 2.0, &lut, &mut out);
+        let px: Vec<[u8; 3]> = out
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|p| [p[0], p[1], p[2]])
+            .collect();
+        assert_eq!(px[0], lut[0], "colder than the span: clamped");
+        assert_eq!(px[1], lut[0]);
+        assert_eq!(px[2], lut[128]);
+        assert_eq!(px[3], lut[255]);
+        assert_eq!(px[4], lut[255]);
+        // Warmer is red, colder is blue.
+        assert!(lut[200][0] > 150 && lut[200][2] < 50);
+        assert!(lut[55][2] > 150 && lut[55][0] < 50);
+        // A zero span does not divide by zero.
+        colorize_difference(&[0.0], 0.0, &lut, &mut out);
+        assert_eq!(out.len(), 4);
     }
 
     #[test]

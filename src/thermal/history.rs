@@ -2,6 +2,8 @@
 
 use std::collections::{BTreeMap, VecDeque};
 
+use super::delta::Delta;
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Sample {
     /// Seconds since the history started.
@@ -21,6 +23,8 @@ pub struct History {
     spots: BTreeMap<u32, VecDeque<(f64, f32)>>,
     /// Per Box/Line series keyed by shape id: (t, [maximum, mean]).
     shapes: BTreeMap<u32, VecDeque<(f64, [f32; 2])>>,
+    /// Per difference between two measurements: (t, value).
+    deltas: Vec<(Delta, VecDeque<(f64, f32)>)>,
 }
 
 /// Which statistic of a Box or Line to plot.
@@ -43,6 +47,7 @@ impl History {
             samples: VecDeque::new(),
             spots: BTreeMap::new(),
             shapes: BTreeMap::new(),
+            deltas: Vec::new(),
         }
     }
 
@@ -50,6 +55,43 @@ impl History {
         self.samples.clear();
         self.spots.clear();
         self.shapes.clear();
+        self.deltas.clear();
+    }
+
+    /// Add the differences of the frame just pushed (same time), and forget the series of
+    /// differences no longer listed in `values` (deleted, or without a value). Call after
+    /// [`History::push`].
+    pub fn push_deltas(&mut self, values: &[(Delta, f32)]) {
+        let Some(t) = self.latest_t() else {
+            return;
+        };
+        let cutoff = t - self.keep_secs;
+        self.deltas
+            .retain(|(d, _)| values.iter().any(|(v, _)| v == d));
+        for &(d, v) in values {
+            let series = match self.deltas.iter().position(|(x, _)| *x == d) {
+                Some(i) => &mut self.deltas[i].1,
+                None => {
+                    self.deltas.push((d, VecDeque::new()));
+                    &mut self.deltas.last_mut().unwrap().1
+                }
+            };
+            series.push_back((t, v));
+            while series.front().is_some_and(|(st, _)| *st < cutoff) {
+                series.pop_front();
+            }
+        }
+    }
+
+    pub fn delta_points(&self, d: &Delta, window: f64) -> Vec<[f64; 2]> {
+        let (Some(now), Some((_, series))) =
+            (self.latest_t(), self.deltas.iter().find(|(x, _)| x == d))
+        else {
+            return Vec::new();
+        };
+        let start = series.partition_point(|(t, _)| now - t > window);
+        let points = series.range(start..);
+        thin(points.len(), points.map(|(t, v)| [t - now, *v as f64]))
     }
 
     /// Add one frame: its statistics, the spot values as (id, value) and the Box/Line values
@@ -241,6 +283,34 @@ mod tests {
             vec![[-2.0, 2.0], [-1.0, 3.0], [0.0, 4.0]]
         );
         assert_eq!(h.spot_points(1, 1.0), vec![[-1.0, 13.0], [0.0, 14.0]]);
+    }
+
+    #[test]
+    fn differences_follow_the_samples() {
+        use crate::thermal::alarm::{Metric, Source};
+        let d1 = Delta {
+            a: Source::Frame(Metric::Max),
+            b: Source::Center,
+        };
+        let d2 = Delta {
+            a: Source::Center,
+            b: Source::Spot(1),
+        };
+        let mut h = History::new(10.0);
+        h.push_deltas(&[(d1, 1.0)]); // nothing pushed yet: ignored
+        h.push(s(0.0, 1.0), &[], &[]);
+        h.push_deltas(&[(d1, 2.0), (d2, -1.0)]);
+        h.push(s(5.0, 1.0), &[], &[]);
+        h.push_deltas(&[(d1, 3.0)]);
+        h.push(s(12.0, 1.0), &[], &[]);
+        h.push_deltas(&[(d1, 4.0)]);
+        assert_eq!(h.delta_points(&d1, 100.0), vec![[-7.0, 3.0], [0.0, 4.0]]);
+        assert!(
+            h.delta_points(&d2, 100.0).is_empty(),
+            "removed from the list"
+        );
+        h.clear();
+        assert!(h.delta_points(&d1, 100.0).is_empty());
     }
 
     #[test]

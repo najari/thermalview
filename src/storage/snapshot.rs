@@ -36,6 +36,18 @@ pub struct DeltaReading {
     pub value: f32,
 }
 
+/// The difference image a snapshot's color picture shows.
+#[derive(Debug, Clone, Serialize)]
+pub struct DifferenceInfo {
+    /// Local time of day the reference frame was taken.
+    pub reference_local: String,
+    /// The colors run from −span to +span.
+    pub span: f32,
+    /// Largest drop and largest rise in the image.
+    pub min: f32,
+    pub max: f32,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SnapshotMeta {
     pub app: &'static str,
@@ -57,6 +69,10 @@ pub struct SnapshotMeta {
     /// Strength of the temporal noise filter the frame went through (`null` when off). The
     /// 16-bit PNG holds the filtered counts.
     pub noise_filter: Option<u8>,
+    /// Set when the color image is a difference image (change since a reference frame) and
+    /// `range` is ± its span; `null` for a temperature image. The 16-bit PNG always holds
+    /// temperatures.
+    pub difference: Option<DifferenceInfo>,
     pub device: Option<String>,
     pub lepton_part: Option<String>,
     pub fpa_c: Option<f32>,
@@ -268,6 +284,7 @@ mod tests {
             shapes: vec![],
             deltas: vec![],
             noise_filter: None,
+            difference: None,
             device: None,
             lepton_part: None,
             fpa_c: None,

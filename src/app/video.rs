@@ -99,15 +99,27 @@ impl ThermalApp {
         let unit = f.unit();
         let mut marks = Vec::new();
         if self.settings.show_extremes {
-            for (at, v, color) in [
-                (st.max_pos, f.value(st.max), MAX_COLOR),
-                (st.min_pos, f.value(st.min), MIN_COLOR),
-            ] {
-                marks.push(Mark::Cross {
-                    at,
-                    text: format!("{v:.1}{unit}"),
-                    color,
-                });
+            // As on screen: the extremes of the differences in a difference image.
+            let extremes = match self.diff_stats {
+                Some(d) => [
+                    (d.max_pos, format!("Δ{:+.1}{unit}", d.max), MAX_COLOR),
+                    (d.min_pos, format!("Δ{:+.1}{unit}", d.min), MIN_COLOR),
+                ],
+                None => [
+                    (
+                        st.max_pos,
+                        format!("{:.1}{unit}", f.value(st.max)),
+                        MAX_COLOR,
+                    ),
+                    (
+                        st.min_pos,
+                        format!("{:.1}{unit}", f.value(st.min)),
+                        MIN_COLOR,
+                    ),
+                ],
+            };
+            for (at, text, color) in extremes {
+                marks.push(Mark::Cross { at, text, color });
             }
         }
         for s in &self.settings.spots.items {
@@ -157,12 +169,16 @@ impl ThermalApp {
         if f.calibration.is_some() {
             caption.push_str(&format!("  보정: {}", self.settings.calibration.summary()));
         }
+        if let Some(d) = self.diff.as_ref().filter(|_| self.diff_stats.is_some()) {
+            caption.push_str(&format!("  차이 영상(기준 {})", d.taken));
+        }
         Some(Scene {
             width: f.width,
             height: f.height,
             rgba: self.rgba.clone(),
             lut: self.lut.1.to_vec(),
             range: self.display_range,
+            signed: self.diff_stats.is_some(),
             band: self.settings.isotherm.limits().map(|(lo, hi)| BandMark {
                 lo,
                 hi,

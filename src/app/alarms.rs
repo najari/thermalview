@@ -1,12 +1,14 @@
 //! Temperature alarm UI: banner, rule editor and event log.
 
 use std::collections::VecDeque;
+use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32};
 
 use super::ThermalApp;
 use crate::camera::{CameraStatus, ConnState};
 use crate::settings::Settings;
+use crate::storage::alarm_log::{self, Event};
 use crate::thermal::alarm::{AlarmConfig, Condition, Metric, Monitor, Source, Suspended};
 use crate::thermal::measure::Spots;
 use crate::thermal::shapes::Shapes;
@@ -28,11 +30,21 @@ pub(super) struct AlarmState {
     log: VecDeque<LogEntry>,
     /// Monitoring stopped while rules were armed, so its return is worth logging.
     interrupted: bool,
+    /// The MP4 being recorded was started by an alarm (and is ended by it). Since when no
+    /// alarm has been active, while that recording runs.
+    auto_video: Option<Option<Instant>>,
+    /// Writing `alarm_log.csv` failed; reported once until a write works again.
+    file_failed: bool,
 }
 
 impl AlarmState {
     pub(super) fn monitor(&self) -> &Monitor {
         &self.monitor
+    }
+
+    /// The running MP4 was started by an alarm.
+    pub(super) fn auto_video(&self) -> bool {
+        self.auto_video.is_some()
     }
 
     fn push(&mut self, text: String, color: Option<Color32>) {
@@ -85,42 +97,53 @@ pub(super) fn update(
                 app.alarms
                     .push(format!("감시 중단: {}", w.label()), Some(AMBER));
                 app.alarms.interrupted = true;
+                write_file(app, Event::Paused, w.label(), None);
             }
             None if app.alarms.interrupted => {
                 app.alarms.push("감시 재개".into(), None);
                 app.alarms.interrupted = false;
+                write_file(app, Event::Resumed, "", None);
             }
             _ => {}
         }
         app.alarms.monitor.set_suspended(why);
     }
 
-    let (Some(t), Some(f), Some(st)) = (new_live, &app.frame, &app.stats) else {
-        return;
-    };
-    let s = &app.settings;
-    let changes = app
-        .alarms
-        .monitor
-        .update(&s.alarms, t, |src| src.read(f, st, &s.spots, &s.shapes));
     let mut raised = false;
-    for c in changes {
-        let Some(rule) = s.alarms.rules.iter().find(|r| r.id == c.rule_id) else {
-            continue;
-        };
-        let what = rule.describe(&s.shapes);
-        if c.raised {
-            raised = true;
-            log::warn!("alarm raised: {what}, value {:.2} C", c.value);
-            app.alarms
-                .push(format!("발생: {what} ({:.2} °C)", c.value), Some(RED));
-            ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
-                egui::UserAttentionType::Critical,
-            ));
-        } else {
-            log::info!("alarm cleared: {what}, value {:.2} C", c.value);
-            app.alarms
-                .push(format!("해제: {what} ({:.2} °C)", c.value), Some(GREEN));
+    if let (Some(t), Some(f), Some(st)) = (new_live, &app.frame, &app.stats) {
+        let s = &app.settings;
+        let changes = app
+            .alarms
+            .monitor
+            .update(&s.alarms, t, |r| r.read(f, st, &s.spots, &s.shapes));
+        let mut events = Vec::new();
+        for c in changes {
+            let Some(rule) = s.alarms.rules.iter().find(|r| r.id == c.rule_id) else {
+                continue;
+            };
+            let what = rule.describe(&s.shapes);
+            if c.raised {
+                raised = true;
+                log::warn!("alarm raised: {what}, value {:.2} C", c.value);
+                app.alarms
+                    .push(format!("발생: {what} ({:.2} °C)", c.value), Some(RED));
+                ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
+                    egui::UserAttentionType::Critical,
+                ));
+            } else {
+                log::info!("alarm cleared: {what}, value {:.2} C", c.value);
+                app.alarms
+                    .push(format!("해제: {what} ({:.2} °C)", c.value), Some(GREEN));
+            }
+            let event = if c.raised {
+                Event::Raised
+            } else {
+                Event::Cleared
+            };
+            events.push((event, what, c.value));
+        }
+        for (event, what, value) in events {
+            write_file(app, event, &what, Some(value));
         }
     }
     // One picture of the frame that raised it, however many rules tripped together.
@@ -128,6 +151,63 @@ pub(super) fn update(
         if let Ok(path) = app.take_snapshot(status) {
             let name = path.file_name().unwrap_or_default().to_string_lossy();
             app.alarms.push(format!("스냅샷 저장: {name}"), None);
+        }
+    }
+    auto_video(app, raised);
+}
+
+/// Start an MP4 when an alarm is raised and nothing is being recorded; end it once no alarm
+/// has been active for `record_after_s` seconds. A recording the user started is left alone,
+/// and one the user stopped is not restarted until the next alarm.
+fn auto_video(app: &mut ThermalApp, raised: bool) {
+    if app.alarms.auto_video.is_some() && app.video.is_none() {
+        // Stopped by the user, by an error or by a change of camera.
+        app.alarms.auto_video = None;
+    }
+    if raised && app.settings.alarms.record_on_raise && app.video.is_none() {
+        if let Ok(path) = app.start_video() {
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            app.alarms.push(format!("MP4 녹화 시작: {name}"), None);
+            app.alarms.auto_video = Some(None);
+        }
+    }
+    let Some(quiet_since) = app.alarms.auto_video else {
+        return;
+    };
+    if app.alarms.monitor.any_active() {
+        app.alarms.auto_video = Some(None);
+        return;
+    }
+    let since = quiet_since.unwrap_or_else(Instant::now);
+    app.alarms.auto_video = Some(Some(since));
+    let after = Duration::from_secs_f32(app.settings.alarms.record_after_s.clamp(0.0, 3600.0));
+    if since.elapsed() >= after {
+        app.alarms.auto_video = None;
+        let msg = match app.stop_video() {
+            Ok((path, n)) => {
+                let name = path.file_name().unwrap_or_default().to_string_lossy();
+                format!("MP4 녹화 종료: {name} ({n}프레임)")
+            }
+            Err(e) => format!("MP4 녹화 종료: {e}"),
+        };
+        app.alarms.push(msg, None);
+    }
+}
+
+/// Append to `alarm_log.csv` when the option is on. A failure is shown once, not per event.
+fn write_file(app: &mut ThermalApp, event: Event, what: &str, value: Option<f32>) {
+    if !app.settings.alarms.log_to_file {
+        return;
+    }
+    match alarm_log::append(&app.settings.snapshot_dir(), event, what, value) {
+        Ok(_) => app.alarms.file_failed = false,
+        Err(e) => {
+            log::warn!("writing the alarm log failed: {e:#}");
+            if !app.alarms.file_failed {
+                app.alarms.file_failed = true;
+                app.alarms
+                    .push(format!("경보 기록 파일 저장 실패: {e}"), Some(AMBER));
+            }
         }
     }
 }
@@ -228,7 +308,8 @@ pub(super) fn controls(ui: &mut egui::Ui, app: &mut ThermalApp) {
         let mut remove = None;
         for r in &mut cfg.rules {
             ui.push_id(r.id, |ui| {
-                ui.horizontal(|ui| {
+                // Wrapped: a row wider than the panel would widen everything under it.
+                ui.horizontal_wrapped(|ui| {
                     changed |= ui.checkbox(&mut r.enabled, "").changed();
                     egui::ComboBox::from_id_salt("source")
                         .width(92.0)
@@ -240,26 +321,71 @@ pub(super) fn controls(ui: &mut egui::Ui, app: &mut ThermalApp) {
                                     .changed();
                             }
                         });
+                    ui.label("−");
+                    egui::ComboBox::from_id_salt("minus")
+                        .width(72.0)
+                        .selected_text(r.minus.map_or("없음".into(), |s| s.label(shapes)))
+                        .show_ui(ui, |ui| {
+                            changed |= ui.selectable_value(&mut r.minus, None, "없음").changed();
+                            for s in options.iter().filter(|s| **s != r.source) {
+                                changed |= ui
+                                    .selectable_value(&mut r.minus, Some(*s), s.label(shapes))
+                                    .changed();
+                            }
+                        })
+                        .response
+                        .on_hover_text("다른 측정을 고르면 두 값의 차(왼쪽 − 오른쪽)를 감시합니다");
+                });
+                if r.minus == Some(r.source) {
+                    r.minus = None;
+                }
+                let before = r.condition;
+                ui.horizontal_wrapped(|ui| {
                     egui::ComboBox::from_id_salt("condition")
-                        .width(52.0)
+                        .width(60.0)
                         .selected_text(r.condition.label())
                         .show_ui(ui, |ui| {
-                            for c in [Condition::Above, Condition::Below] {
+                            for c in Condition::ALL {
                                 changed |= ui
                                     .selectable_value(&mut r.condition, c, c.label())
                                     .changed();
                             }
                         });
-                });
-                ui.horizontal(|ui| {
+                    if r.condition == Condition::Outside
+                        && before != Condition::Outside
+                        && r.upper <= r.threshold
+                    {
+                        // Rules saved before ranges existed have no upper limit yet.
+                        r.upper = r.threshold + 10.0;
+                    }
+                    // The field clamps what it shows: a difference can be well below −40.
+                    let limits = if r.minus.is_some() {
+                        -640.0..=640.0
+                    } else {
+                        -40.0..=600.0
+                    };
                     changed |= ui
                         .add(
                             egui::DragValue::new(&mut r.threshold)
                                 .speed(0.1)
-                                .range(-40.0..=600.0)
+                                .range(limits.clone())
                                 .suffix(" °C"),
                         )
                         .changed();
+                    if r.condition == Condition::Outside {
+                        ui.label("~");
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut r.upper)
+                                    .speed(0.1)
+                                    .range(limits)
+                                    .suffix(" °C"),
+                            )
+                            .on_hover_text("이 범위를 벗어나면 경보")
+                            .changed();
+                    }
+                });
+                ui.horizontal(|ui| {
                     match monitor.value(r.id) {
                         Some(v) if monitor.is_active(r.id) => {
                             ui.colored_label(RED, format!("경보 {v:.1} °C"));
@@ -323,6 +449,34 @@ pub(super) fn controls(ui: &mut egui::Ui, app: &mut ThermalApp) {
         changed |= ui
             .checkbox(&mut cfg.snapshot_on_raise, "경보 발생 시 스냅샷 저장")
             .on_hover_text("경보가 발생한 순간의 영상을 저장 폴더에 스냅샷으로 남깁니다")
+            .changed();
+        ui.horizontal_wrapped(|ui| {
+            changed |= ui
+                .checkbox(&mut cfg.record_on_raise, "경보 중 MP4 녹화")
+                .on_hover_text(
+                    "경보가 발생하면 MP4 녹화를 시작하고, 모든 경보가 해제된 뒤 정한 시간이 \
+                     지나면 끝냅니다. 이미 녹화 중이면 그 녹화를 그대로 둡니다. 발생 전 \
+                     영상은 담기지 않습니다",
+                )
+                .changed();
+            ui.add_enabled_ui(cfg.record_on_raise, |ui| {
+                ui.label("해제 후");
+                changed |= ui
+                    .add(
+                        egui::DragValue::new(&mut cfg.record_after_s)
+                            .speed(0.5)
+                            .range(0.0..=600.0)
+                            .suffix(" 초"),
+                    )
+                    .changed();
+            });
+        });
+        changed |= ui
+            .checkbox(&mut cfg.log_to_file, "경보 기록을 파일로 저장")
+            .on_hover_text(format!(
+                "발생·해제·감시 중단·재개를 저장 폴더의 {}에 한 줄씩 덧붙입니다",
+                alarm_log::FILE_NAME
+            ))
             .changed();
     }
     egui::CollapsingHeader::new(format!("경보 기록 ({})", app.alarms.log.len()))
@@ -453,6 +607,113 @@ mod tests {
             .text
             .starts_with("스냅샷 저장: thermal_"));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_alarm_records_an_mp4_until_it_clears() {
+        let dir = std::env::temp_dir().join(format!("thermalview_alarmmp4_{}", std::process::id()));
+        let (mut app, ctx) = rig(Some(0.01));
+        app.settings.snapshot_dir = Some(dir.clone());
+        app.settings.alarms.record_on_raise = true;
+        app.settings.alarms.record_after_s = 0.0;
+        update(&mut app, &ctx, &streaming(), Some(0.0));
+        assert!(app.video.is_none(), "not before the hold time");
+        update(&mut app, &ctx, &streaming(), Some(1.0));
+        assert!(app.video.is_some() && app.alarms.auto_video());
+        // Still active: keeps recording.
+        update(&mut app, &ctx, &streaming(), Some(2.0));
+        assert!(app.video.is_some());
+        // Raising the threshold restarts the rule: nothing is active, and after 0 s it ends.
+        app.settings.alarms.rules[0].threshold = 50.0;
+        update(&mut app, &ctx, &streaming(), Some(3.0));
+        assert!(app.video.is_none() && !app.alarms.auto_video());
+        assert!(app
+            .alarms
+            .log
+            .back()
+            .unwrap()
+            .text
+            .starts_with("MP4 녹화 종료"));
+
+        // A recording the user started is neither taken over nor ended.
+        app.settings.alarms.rules[0].threshold = 20.0;
+        app.start_video().unwrap();
+        update(&mut app, &ctx, &streaming(), Some(4.0));
+        update(&mut app, &ctx, &streaming(), Some(5.0));
+        app.settings.alarms.rules[0].threshold = 50.0;
+        update(&mut app, &ctx, &streaming(), Some(6.0));
+        assert!(app.video.is_some() && !app.alarms.auto_video());
+        let _ = app.stop_video();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn events_go_to_the_alarm_file_when_asked() {
+        let dir =
+            std::env::temp_dir().join(format!("thermalview_alarmfile_{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let (mut app, ctx) = rig(Some(0.01));
+        app.settings.snapshot_dir = Some(dir.clone());
+        let file = dir.join(alarm_log::FILE_NAME);
+        update(&mut app, &ctx, &streaming(), Some(0.0));
+        update(&mut app, &ctx, &streaming(), Some(1.0));
+        assert!(!file.exists(), "off by default");
+
+        app.settings.alarms.log_to_file = true;
+        update(&mut app, &ctx, &CameraStatus::default(), None);
+        update(&mut app, &ctx, &streaming(), Some(2.0));
+        update(&mut app, &ctx, &streaming(), Some(3.0));
+        let text = std::fs::read_to_string(&file).unwrap();
+        let events: Vec<&str> = text
+            .lines()
+            .skip(1)
+            .map(|l| l.split(',').nth(1).unwrap())
+            .collect();
+        assert_eq!(events, ["paused", "resumed", "raised"]);
+        assert!(
+            text.contains(",raised,화면 최고 20.0 °C 이상,26.85"),
+            "{text}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The settings panel starts 300 points wide: a rule with every field shown (a range, a
+    /// difference of two long names) and the options under it must fit without widening it.
+    #[test]
+    fn the_rule_editor_fits_the_panel() {
+        let (mut app, _) = rig(Some(0.01));
+        let ctx = egui::Context::default();
+        let mut first = ctx.run_ui(egui::RawInput::default(), |_| {});
+        first.textures_delta.clear();
+        let b = app
+            .settings
+            .shapes
+            .add(crate::thermal::shapes::ShapeKind::Box, (1, 1), (9, 9))
+            .unwrap();
+        let s = app.settings.spots.add(5, 5).unwrap();
+        let cfg = &mut app.settings.alarms;
+        cfg.rules[0].source = Source::Shape(b, Metric::Mean);
+        cfg.rules[0].minus = Some(Source::Spot(s));
+        cfg.rules[0].condition = Condition::Outside;
+        cfg.rules[0].threshold = -123.4;
+        cfg.rules[0].upper = 456.7;
+        cfg.record_on_raise = true;
+        const WIDTH: f32 = 280.0;
+        let mut used = 0.0;
+        for _ in 0..2 {
+            let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+                let r = ui.allocate_ui(egui::vec2(WIDTH, 2000.0), |ui| {
+                    ui.set_max_width(WIDTH);
+                    controls(ui, &mut app);
+                    ui.min_rect().width()
+                });
+                used = r.inner;
+            });
+            out.textures_delta.clear();
+        }
+        assert!(used <= WIDTH + 0.5, "the editor is {used} wide");
+        // Not clamped to the −40 °C a plain temperature allows.
+        assert_eq!(app.settings.alarms.rules[0].threshold, -123.4);
     }
 
     #[test]

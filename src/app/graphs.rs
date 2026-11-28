@@ -26,6 +26,8 @@ pub struct GraphState {
     /// Maximum / mean of each Box and Line.
     show_shape_max: bool,
     show_shape_mean: bool,
+    /// Differences between two measurements.
+    show_deltas: bool,
 }
 
 impl Default for GraphState {
@@ -39,6 +41,7 @@ impl Default for GraphState {
             show_center: false,
             show_shape_max: true,
             show_shape_mean: false,
+            show_deltas: true,
         }
     }
 }
@@ -90,6 +93,11 @@ pub(super) fn show(ui: &mut egui::Ui, app: &mut ThermalApp) {
                 ui.checkbox(&mut g.show_shape_max, "영역 최고")
                     .on_hover_text("영역(B)과 선(L)마다 그 안의 최고 온도");
                 ui.checkbox(&mut g.show_shape_mean, "영역 평균");
+            }
+            if !app.settings.deltas.items.is_empty() {
+                ui.separator();
+                ui.checkbox(&mut g.show_deltas, "측정 차")
+                    .on_hover_text("측정 구역에서 만든 두 측정의 차(점선)");
             }
             if ui.button("지우기").clicked() {
                 app.history.clear();
@@ -189,6 +197,19 @@ fn time_plot(ui: &mut egui::Ui, app: &ThermalApp, unit: &str) {
             h.shape_points(s.id, window, ShapeValue::Mean),
         );
     }
+    // Dashed, so a difference near 0 is not mistaken for a temperature.
+    let used = spots + app.settings.shapes.items.len();
+    for (i, d) in app.settings.deltas.items.iter().enumerate() {
+        let pts = h.delta_points(d, window);
+        if g.show_deltas && !pts.is_empty() {
+            lines.push(
+                Line::new(format!("Δ {}", d.label(&app.settings.shapes)), pts)
+                    .color(SPOT_COLORS[(used + i) % SPOT_COLORS.len()])
+                    .width(1.5)
+                    .style(egui_plot::LineStyle::dashed_dense()),
+            );
+        }
+    }
 
     let unit = unit.to_string();
     Plot::new("time_plot")
@@ -212,7 +233,18 @@ fn histogram_plot(ui: &mut egui::Ui, app: &ThermalApp, unit: &str) {
         return;
     };
     let (lo, hi) = app.display_range;
-    let hist = Histogram::compute(f, lo, hi, 64);
+    // What the image shows: temperatures, or the differences of a difference image.
+    let diff = app.diff_stats.is_some();
+    let hist = if diff {
+        Histogram::of(app.diff_values.iter().copied(), lo, hi, 64)
+    } else {
+        Histogram::compute(f, lo, hi, 64)
+    };
+    let unit = if diff {
+        format!("Δ {unit}")
+    } else {
+        unit.to_string()
+    };
     let lut = &app.lut.1;
     let n = hist.counts.len();
     let bars: Vec<Bar> = hist
@@ -226,7 +258,7 @@ fn histogram_plot(ui: &mut egui::Ui, app: &ThermalApp, unit: &str) {
         })
         .collect();
     Plot::new("histogram")
-        .x_axis_label(unit.to_string())
+        .x_axis_label(unit)
         .y_axis_label("화소 %")
         .allow_scroll(false)
         .allow_drag(false)

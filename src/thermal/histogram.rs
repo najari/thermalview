@@ -13,12 +13,17 @@ pub struct Histogram {
 impl Histogram {
     /// Bin the frame between `lo..hi` (display units). Values outside go to the end bins.
     pub fn compute(f: &ThermalFrame, lo: f32, hi: f32, bins: usize) -> Self {
+        Self::of(f.raw.iter().map(|&r| f.value(r)), lo, hi, bins)
+    }
+
+    /// Bin any values (the differences of a difference image) between `lo..hi`.
+    pub fn of(values: impl Iterator<Item = f32>, lo: f32, hi: f32, bins: usize) -> Self {
         let bins = bins.max(1);
         let (lo, hi) = if hi > lo { (lo, hi) } else { (lo, lo + 1.0) };
         let bin_width = (hi - lo) / bins as f32;
         let mut counts = vec![0u32; bins];
-        for &r in &f.raw {
-            let i = ((f.value(r) - lo) / bin_width).floor();
+        for v in values {
+            let i = ((v - lo) / bin_width).floor();
             let i = (i.max(0.0) as usize).min(bins - 1);
             counts[i] += 1;
         }

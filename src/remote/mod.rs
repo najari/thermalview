@@ -33,6 +33,16 @@ pub enum IsoSet {
     Between(f32, f32),
 }
 
+/// Difference image.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DiffSet {
+    /// Take the current frame as the reference and show the change since then.
+    On,
+    Off,
+    /// Color span, ± this many display units; `None` follows the image.
+    Span(Option<f32>),
+}
+
 /// Magnification of the image view, optionally centered on a pixel.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ZoomSet {
@@ -76,6 +86,7 @@ pub enum Request {
     /// Hold the current image (incoming frames are dropped) or go back to live video.
     Freeze(Option<bool>),
     Isotherm(Option<IsoSet>),
+    Diff(Option<DiffSet>),
     /// Strength of the temporal noise filter (1 = off).
     Filter(Option<u8>),
     Zoom(Option<ZoomSet>),
@@ -86,7 +97,7 @@ pub enum Request {
 }
 
 pub const HELP: &str = "commands: STATUS | MEAS | TEMP x y | SPOT [LIST|ADD x y|DEL id|CLEAR] | \
-PALETTE [name] | RANGE [AUTO|ROBUST|lo hi] | ISOTHERM [OFF|ABOVE t|BELOW t|BETWEEN lo hi] | \
+PALETTE [name] | RANGE [AUTO|ROBUST|lo hi] | ISOTHERM [OFF|ABOVE t|BELOW t|BETWEEN lo hi] | DIFF [ON|OFF|SPAN AUTO|SPAN x] | \
 FILTER [1|2|4|8|16] | ROTATE [0|90|180|270] | EMISSIVITY [e] | ALARMS | FREEZE [ON|OFF] | ZOOM [factor [x y]] | \
 SNAPSHOT | CSV START|STOP | REC START|STOP | MP4 START|STOP | FRAME | ALIGN | SCREENSHOT | QUIT";
 
@@ -128,6 +139,16 @@ pub fn parse(line: &str) -> Result<Request, String> {
             }
             Request::Isotherm(Some(IsoSet::Between(lo, hi)))
         }
+        ["DIFF"] => Request::Diff(None),
+        ["DIFF", "ON"] => Request::Diff(Some(DiffSet::On)),
+        ["DIFF", "OFF"] => Request::Diff(Some(DiffSet::Off)),
+        ["DIFF", "SPAN", "AUTO"] => Request::Diff(Some(DiffSet::Span(None))),
+        ["DIFF", "SPAN", s] => Request::Diff(Some(DiffSet::Span(Some(
+            number(s)
+                .ok()
+                .filter(|s| (0.1..=1000.0).contains(s))
+                .ok_or_else(|| format!("span {s}: use AUTO or 0.1 to 1000"))?,
+        )))),
         ["FILTER"] => Request::Filter(None),
         ["FILTER", "OFF"] => Request::Filter(Some(1)),
         ["FILTER", n] => Request::Filter(Some(
@@ -182,6 +203,7 @@ pub fn parse(line: &str) -> Result<Request, String> {
                 "PALETTE",
                 "RANGE",
                 "ISOTHERM",
+                "DIFF",
                 "FILTER",
                 "FREEZE",
                 "ZOOM",
@@ -372,6 +394,17 @@ mod tests {
             parse("isotherm off"),
             Ok(Request::Isotherm(Some(IsoSet::Off)))
         );
+        assert_eq!(parse("diff"), Ok(Request::Diff(None)));
+        assert_eq!(parse("diff on"), Ok(Request::Diff(Some(DiffSet::On))));
+        assert_eq!(
+            parse("DIFF SPAN 2.5"),
+            Ok(Request::Diff(Some(DiffSet::Span(Some(2.5)))))
+        );
+        assert_eq!(
+            parse("diff span auto"),
+            Ok(Request::Diff(Some(DiffSet::Span(None))))
+        );
+        assert!(parse("DIFF SPAN 0").unwrap_err().contains("AUTO"));
         assert_eq!(parse("filter 8"), Ok(Request::Filter(Some(8))));
         assert_eq!(parse("filter off"), Ok(Request::Filter(Some(1))));
         assert!(parse("FILTER 3").unwrap_err().contains("16"));

@@ -3,6 +3,7 @@
 pub mod alarm;
 pub mod calibration;
 pub mod delta;
+pub mod diff;
 pub mod filter;
 pub mod frame;
 pub mod histogram;

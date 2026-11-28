@@ -34,6 +34,8 @@ pub struct Settings {
     pub isotherm: Isotherm,
     /// Strength of the temporal noise filter (frames averaged); 1 = off.
     pub noise_filter: u8,
+    /// Color range of the difference image, ± this many display units; 0 follows the image.
+    pub diff_span: f32,
     pub spots: Spots,
     /// Box and Line measurements.
     pub shapes: Shapes,
@@ -141,6 +143,7 @@ impl Default for Settings {
             range: RangeMode::default(),
             isotherm: Isotherm::default(),
             noise_filter: 1,
+            diff_span: 0.0,
             spots: Spots::default(),
             shapes: Shapes::default(),
             deltas: Deltas::default(),
@@ -219,6 +222,9 @@ impl Settings {
             self.csv_interval_s = 0.0;
         }
         self.timelapse_s = self.timelapse_s.clamp(1, 3600);
+        if !(self.diff_span.is_finite() && (0.0..=1000.0).contains(&self.diff_span)) {
+            self.diff_span = 0.0;
+        }
         let iso = &mut self.isotherm;
         if !(iso.lo.is_finite() && iso.hi.is_finite()) {
             *iso = Isotherm::default();

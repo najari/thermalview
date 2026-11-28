@@ -21,10 +21,11 @@ use crate::settings::{Layout, Settings};
 use crate::storage::csv_log::{self, CsvLog};
 use crate::storage::sequence::{self, SeqHeader, SeqWriter};
 use crate::storage::snapshot::{
-    self, DeltaReading, ShapeReading, SnapshotMeta, SpotReading, WebcamInfo,
+    self, DeltaReading, DifferenceInfo, ShapeReading, SnapshotMeta, SpotReading, WebcamInfo,
 };
 use crate::thermal::alarm::{Metric, Source as Reading};
 use crate::thermal::delta::{Delta, Deltas};
+use crate::thermal::diff::{DiffStats, Reference};
 use crate::thermal::filter::Temporal;
 use crate::thermal::frame::{FrameStats, ThermalFrame};
 use crate::thermal::history::{History, Sample};
@@ -46,6 +47,13 @@ pub(crate) enum Hold {
     Frozen,
     /// A saved snapshot is open; its base file name.
     Snapshot(String),
+}
+
+/// The "before" of the difference image.
+struct DiffState {
+    reference: Reference,
+    /// When it was taken, as shown to the user (local time of day).
+    taken: String,
 }
 
 /// A series of snapshots taken at a fixed interval.
@@ -121,8 +129,14 @@ pub struct ThermalApp {
     upscayl: Option<crate::upscayl::Upscayl>,
     /// Running AI upscales: each reports the written file or an error.
     ai_jobs: Vec<mpsc::Receiver<Result<PathBuf, String>>>,
-    /// The color table in use, with the palette and direction it was built for.
-    lut: ((Palette, bool), [[u8; 3]; 256]),
+    /// The color table in use, with what it was built for: the palette, its direction, and
+    /// whether it is the table of the difference image instead.
+    lut: ((Palette, bool, bool), [[u8; 3]; 256]),
+    /// Difference image: the reference frame, when it is on.
+    diff: Option<DiffState>,
+    /// Current frame minus the reference, per pixel (empty when off).
+    diff_values: Vec<f32>,
+    diff_stats: Option<DiffStats>,
     auto_range: AutoRange,
     /// Range used for the current image, in display units.
     display_range: (f32, f32),
@@ -201,7 +215,7 @@ impl ThermalApp {
     }
 
     fn with_camera(settings: Settings, camera: Camera) -> Self {
-        let key = (settings.palette, settings.palette_invert);
+        let key = (settings.palette, settings.palette_invert, false);
         let lut = (key, key.0.lut_of(key.1));
         Self {
             camera,
@@ -219,6 +233,9 @@ impl ThermalApp {
             lut,
             auto_range: AutoRange::default(),
             display_range: (20.0, 40.0),
+            diff: None,
+            diff_values: Vec::new(),
+            diff_stats: None,
             iso_share: None,
             scratch: Vec::new(),
             filter: Temporal::default(),
@@ -325,6 +342,8 @@ impl ThermalApp {
                     let _ = self.stop_video();
                 }
                 self.hold = None;
+                // Another scene: the reference of the difference image no longer applies.
+                self.end_diff();
                 self.history.clear();
                 self.auto_range.reset();
                 self.notify(format!("재생: {}", p.file_name()));
@@ -355,6 +374,7 @@ impl ThermalApp {
             let _ = self.stop_video();
         }
         self.player = None;
+        self.end_diff();
         self.history.clear();
         self.auto_range.reset();
         self.filter.reset();
@@ -386,6 +406,7 @@ impl ThermalApp {
                 Some(Hold::Snapshot(_)) => {
                     self.frame = None;
                     self.stats = None;
+                    self.end_diff();
                     self.history.clear();
                     self.auto_range.reset();
                     self.started = Instant::now();
@@ -433,6 +454,7 @@ impl ThermalApp {
         }
         self.player = None;
         self.hold = None;
+        self.end_diff();
         self.filter.reset();
         // The last played frame is not live video: show nothing until the camera sends one.
         self.frame = None;
@@ -575,6 +597,17 @@ impl ThermalApp {
             .map(|(id, st)| (*id, [st.max, st.mean]))
             .collect();
         self.history.push(sample, &spots, &plotted);
+        let deltas: Vec<(Delta, f32)> = self
+            .settings
+            .deltas
+            .items
+            .iter()
+            .filter_map(|d| {
+                d.read(f, st, &self.settings.spots, &self.settings.shapes)
+                    .map(|v| (*d, v))
+            })
+            .collect();
+        self.history.push_deltas(&deltas);
         // One row per frame, or one every `csv_interval_s` seconds of frame time.
         let every = self.settings.csv_interval_s as f64;
         let due = match self.csv_last {
@@ -598,6 +631,7 @@ impl ThermalApp {
                 fpa_c: self.last_fpa,
                 spots: &spots,
                 shapes: &shapes,
+                deltas: &deltas,
             };
             if let Err(e) = log.write(row) {
                 let msg = format!("CSV 기록 중단: {e}");
@@ -652,7 +686,14 @@ impl ThermalApp {
             .iter()
             .map(|s| (s.id, s.label()))
             .collect();
-        match CsvLog::start(&self.settings.snapshot_dir(), &ids, &shapes, unit) {
+        let deltas: Vec<(Delta, String)> = self
+            .settings
+            .deltas
+            .items
+            .iter()
+            .map(|d| (*d, d.label(&self.settings.shapes)))
+            .collect();
+        match CsvLog::start(&self.settings.snapshot_dir(), &ids, &shapes, &deltas, unit) {
             Ok(log) => {
                 let path = log.path().to_path_buf();
                 self.notify(format!("기록 시작: {}", path.display()));
@@ -783,25 +824,62 @@ impl ThermalApp {
     /// uploaded later by [`Self::upload_texture`], only when the window is drawn: texture
     /// updates made while it is hidden would pile up undelivered.
     fn render(&mut self) {
+        // A reference of another image size or scale (another camera took over) says nothing
+        // about this frame.
+        let stale = match (&self.diff, &self.frame) {
+            (Some(d), Some(f)) => !d.reference.matches(f),
+            _ => false,
+        };
+        if stale {
+            self.end_diff();
+            self.notify("영상 크기가 바뀌어 차이 영상을 껐습니다");
+        }
         let (Some(f), Some(st)) = (&self.frame, &self.stats) else {
             return;
         };
-        let key = (self.settings.palette, self.settings.palette_invert);
+        let diff = self
+            .diff
+            .as_ref()
+            .and_then(|d| d.reference.subtract(f, &mut self.diff_values));
+        self.diff_stats = diff;
+        let key = (
+            self.settings.palette,
+            self.settings.palette_invert,
+            diff.is_some(),
+        );
         if self.lut.0 != key {
-            self.lut = (key, key.0.lut_of(key.1));
+            let table = match key.2 {
+                true => palette::difference_lut(),
+                false => key.0.lut_of(key.1),
+            };
+            self.lut = (key, table);
         }
-        self.display_range = match self.settings.range {
-            RangeMode::Auto => self.auto_range.update(f.value(st.min), f.value(st.max)),
-            RangeMode::Robust => {
-                let (lo, hi) = range::percentiles(&f.raw, range::ROBUST_TAIL, &mut self.scratch)
-                    .unwrap_or((st.min, st.max));
-                self.auto_range.update(f.value(lo), f.value(hi))
-            }
-            RangeMode::Manual { lo, hi } => (lo.min(hi), hi.max(lo)),
-        };
-        let lo = f.raw_from_value(self.display_range.0);
-        let hi = f.raw_from_value(self.display_range.1);
-        palette::colorize(&f.raw, lo, hi, &self.lut.1, &mut self.rgba);
+        // The color range as raw counts; none for a difference image.
+        let mut counts = None;
+        if let Some(d) = diff {
+            // Symmetric around "no change": the chosen span, or one that follows the image.
+            let span = match self.settings.diff_span {
+                s if s > 0.0 => s,
+                _ => self.auto_range.update(-d.reach(), d.reach()).1,
+            };
+            self.display_range = (-span, span);
+            palette::colorize_difference(&self.diff_values, span, &self.lut.1, &mut self.rgba);
+        } else {
+            self.display_range = match self.settings.range {
+                RangeMode::Auto => self.auto_range.update(f.value(st.min), f.value(st.max)),
+                RangeMode::Robust => {
+                    let (lo, hi) =
+                        range::percentiles(&f.raw, range::ROBUST_TAIL, &mut self.scratch)
+                            .unwrap_or((st.min, st.max));
+                    self.auto_range.update(f.value(lo), f.value(hi))
+                }
+                RangeMode::Manual { lo, hi } => (lo.min(hi), hi.max(lo)),
+            };
+            let lo = f.raw_from_value(self.display_range.0);
+            let hi = f.raw_from_value(self.display_range.1);
+            palette::colorize(&f.raw, lo, hi, &self.lut.1, &mut self.rgba);
+            counts = Some((lo, hi));
+        }
         let iso = self.settings.isotherm;
         let band = iso.raw_band(f);
         self.iso_share = band.map(|(a, b)| {
@@ -809,21 +887,67 @@ impl ThermalApp {
             painted as f32 / f.raw.len().max(1) as f32
         });
         let up = self.settings.upscale;
-        if up.enabled {
-            let u = match &mut self.upscaler {
-                Some(u) if u.sharpen() == up.sharpen => u,
-                slot => slot.insert(Upscaler::new(up.sharpen)),
-            };
-            let field = u.upscale(&f.raw, f.width, f.height);
-            palette::colorize_f32(&field, lo, hi, &self.lut.1, &mut self.rgba_up);
-            if let Some((a, b)) = band {
-                palette::paint_band_f32(&field, a, b, iso.color, &mut self.rgba_up);
+        // The 4× image is built from temperatures, so a difference image stays in sensor
+        // pixels.
+        match counts.filter(|_| up.enabled) {
+            Some((lo, hi)) => {
+                let u = match &mut self.upscaler {
+                    Some(u) if u.sharpen() == up.sharpen => u,
+                    slot => slot.insert(Upscaler::new(up.sharpen)),
+                };
+                let field = u.upscale(&f.raw, f.width, f.height);
+                palette::colorize_f32(&field, lo, hi, &self.lut.1, &mut self.rgba_up);
+                if let Some((a, b)) = band {
+                    palette::paint_band_f32(&field, a, b, iso.color, &mut self.rgba_up);
+                }
             }
-        } else {
-            self.rgba_up.clear();
-            self.upscaler = None;
+            None => {
+                self.rgba_up.clear();
+                if !up.enabled {
+                    self.upscaler = None;
+                }
+            }
         }
         self.texture_dirty = true;
+    }
+
+    /// Turn the difference image on, with the current frame as the reference (again when it
+    /// is already on), or off. The error text is for remote clients.
+    pub(super) fn set_diff(&mut self, on: bool) -> Result<(), String> {
+        if !on {
+            if self.diff.is_some() {
+                self.end_diff();
+                self.notify("차이 영상을 껐습니다");
+                self.render();
+            }
+            return Ok(());
+        }
+        let Some(f) = &self.frame else {
+            return Err("no frame yet".into());
+        };
+        // A played-back frame carries no arrival time.
+        let taken = if f.captured == SystemTime::UNIX_EPOCH {
+            chrono::Local::now()
+        } else {
+            chrono::DateTime::<chrono::Local>::from(f.captured)
+        };
+        self.diff = Some(DiffState {
+            reference: Reference::of(f),
+            taken: taken.format("%H:%M:%S").to_string(),
+        });
+        self.auto_range.reset();
+        self.notify("차이 영상: 지금 영상을 기준으로 잡았습니다");
+        self.render();
+        Ok(())
+    }
+
+    /// Forget the reference. The caller redraws.
+    fn end_diff(&mut self) {
+        if self.diff.take().is_some() {
+            self.auto_range.reset();
+        }
+        self.diff_stats = None;
+        self.diff_values.clear();
     }
 
     fn upload_texture(&mut self, ctx: &egui::Context) {
@@ -866,7 +990,8 @@ impl ThermalApp {
         let ai = self
             .upscayl
             .clone()
-            .filter(|_| self.settings.upscale.ai)
+            // The AI copy is drawn from temperatures: not for a difference image.
+            .filter(|_| self.settings.upscale.ai && self.diff_stats.is_none())
             .map(|u| {
                 let input = crate::upscayl::Input {
                     raw: f.raw.clone(),
@@ -944,6 +1069,16 @@ impl ThermalApp {
                 })
                 .collect(),
             noise_filter: Some(self.settings.noise_filter).filter(|n| *n > 1),
+            difference: self
+                .diff
+                .as_ref()
+                .zip(self.diff_stats)
+                .map(|(d, st)| DifferenceInfo {
+                    reference_local: d.taken.clone(),
+                    span: self.display_range.1,
+                    min: st.min,
+                    max: st.max,
+                }),
             device: status.device.as_ref().map(|d| d.product.clone()),
             lepton_part: status.part_number.clone(),
             fpa_c: status.fpa_c,
@@ -1038,6 +1173,9 @@ impl ThermalApp {
             );
             if self.settings.isotherm.enabled {
                 summary.push_str(" · 등온선");
+            }
+            if self.diff.is_some() {
+                summary.push_str(" · 차이");
             }
             self.section(
                 ui,
@@ -1507,6 +1645,7 @@ impl ThermalApp {
                 }
             }
             changed |= self.isotherm_controls(ui, unit);
+            self.diff_controls(ui, unit);
             changed |= ui
                 .checkbox(&mut self.settings.show_extremes, "최고·최저 위치 표시")
                 .changed();
@@ -1662,6 +1801,58 @@ impl ThermalApp {
             }
         });
         changed
+    }
+
+    /// Difference image: on/off (taking the reference), taking it again, and the color span.
+    fn diff_controls(&mut self, ui: &mut egui::Ui, unit: &str) {
+        let was = self.diff.is_some();
+        let mut on = was;
+        let mut retake = false;
+        ui.horizontal(|ui| {
+            ui.add_enabled(
+                was || self.frame.is_some(),
+                egui::Checkbox::new(&mut on, "차이 영상"),
+            )
+            .on_hover_text(
+                "지금 영상을 기준으로 잡고, 그 뒤로 달라진 만큼만 색으로 보여 줍니다. 더워진 곳은 \
+                 빨강·노랑, 식은 곳은 파랑, 그대로인 곳은 검정입니다. 측정값은 바뀌지 않습니다 (D)",
+            );
+            if was && on {
+                retake = ui
+                    .button("기준 다시 잡기")
+                    .on_hover_text("지금 영상을 새 기준으로 삼습니다")
+                    .clicked();
+            }
+        });
+        if on != was {
+            let _ = self.set_diff(on);
+        } else if retake {
+            let _ = self.set_diff(true);
+        }
+        let Some(taken) = self.diff.as_ref().map(|d| d.taken.clone()) else {
+            return;
+        };
+        let mut span = self.settings.diff_span;
+        ui.horizontal(|ui| {
+            ui.weak(format!("기준 {taken}"));
+            egui::ComboBox::from_id_salt("diff_span")
+                .selected_text(span_label(span, unit))
+                .show_ui(ui, |ui| {
+                    for s in [0.0, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0] {
+                        ui.selectable_value(&mut span, s, span_label(s, unit));
+                    }
+                })
+                .response
+                .on_hover_text(
+                    "색으로 나타내는 차이의 범위. 자동은 영상의 가장 큰 차이에 맞춥니다",
+                );
+        });
+        if span != self.settings.diff_span {
+            self.settings.diff_span = span;
+            self.auto_range.reset();
+            self.mark_dirty();
+            self.render();
+        }
     }
 
     /// The list of measurements with their readings. The tools and the whole-image readings
@@ -1898,6 +2089,11 @@ impl ThermalApp {
         }
         self.drag = None;
         self.settings.rotation = new;
+        // The reference of a difference image was taken the other way up.
+        if self.diff.is_some() {
+            self.end_diff();
+            self.notify("영상을 돌려 차이 영상을 껐습니다");
+        }
         self.mark_dirty();
         self.render();
         Ok(())
@@ -2252,6 +2448,14 @@ impl ThermalApp {
             reading(ui, "최저", f.value(st.min), unit, Some(view::MIN_COLOR));
             reading(ui, "평균", f.value_f(st.mean), unit, None);
             reading(ui, "중앙", center, unit, None);
+            if let Some(d) = self.diff_stats {
+                ui.label(
+                    egui::RichText::new(format!("Δ {:+.2} ~ {:+.2} {unit}", d.min, d.max)).strong(),
+                )
+                .on_hover_text(
+                    "차이 영상: 기준 영상보다 가장 많이 내려간 곳 ~ 가장 많이 올라간 곳",
+                );
+            }
             let amber = egui::Color32::from_rgb(215, 120, 0);
             let mut release = false;
             match &self.hold {
@@ -2422,6 +2626,9 @@ impl ThermalApp {
             self.settings.isotherm.enabled = !self.settings.isotherm.enabled;
             self.mark_dirty();
             self.render();
+        }
+        if key(Key::D) && (self.diff.is_some() || self.frame.is_some()) {
+            let _ = self.set_diff(self.diff.is_none());
         }
         // Space pauses a playback (below); on live video it holds the image.
         if self.player.is_none() && self.can_hold() && key(Key::Space) {
@@ -2647,6 +2854,15 @@ fn interval_label(secs: f32) -> String {
         0 => "모든 프레임".into(),
         s if s % 60 == 0 => format!("{}분", s / 60),
         s => format!("{s}초"),
+    }
+}
+
+/// "자동" or "±2 °C": the color span of the difference image.
+fn span_label(span: f32, unit: &str) -> String {
+    if span > 0.0 {
+        format!("±{span:.0} {unit}")
+    } else {
+        "자동".into()
     }
 }
 
@@ -2884,6 +3100,12 @@ mod tests {
         app.show_open_dialog = false;
         pass(&mut app);
         assert_eq!(app.zoom.factor, 3.0, "drawing does not change the zoom");
+        // The difference image, with a fixed span.
+        app.set_diff(true).unwrap();
+        pass(&mut app);
+        app.settings.diff_span = 5.0;
+        app.render();
+        pass(&mut app);
     }
 
     #[test]
@@ -3243,6 +3465,97 @@ mod tests {
         app.camera.inject(flat(30040, 4));
         app.tick(&ctx);
         assert_eq!(app.frame.as_ref().unwrap().raw[0], 30040);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn difference_image_shows_the_change_since_the_reference() {
+        use crate::video::overlay::Mark;
+        let dir = temp("diff");
+        let (mut app, ctx) = app_in(&dir);
+        assert!(
+            app.set_diff(true).is_err(),
+            "no frame to take as the reference"
+        );
+        let frame = |hot: u16, seq| {
+            let mut raw = vec![30000u16; 160 * 120];
+            raw[60 * 160 + 80] = hot;
+            let mut f = ThermalFrame::new(160, 120, raw, Some(0.01));
+            f.sequence = seq;
+            f
+        };
+        let px = |app: &ThermalApp, x: usize, y: usize| {
+            let i = (y * 160 + x) * 4;
+            [app.rgba[i], app.rgba[i + 1], app.rgba[i + 2]]
+        };
+        app.settings.upscale.enabled = true;
+        app.camera.inject(frame(30000, 1));
+        app.tick(&ctx);
+        assert!(!app.rgba_up.is_empty());
+
+        // Nothing has changed yet: every pixel has the "no change" color, at the smallest span.
+        app.set_diff(true).unwrap();
+        let unchanged = palette::difference_lut()[128];
+        assert!(app
+            .rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|p| p[..3] == unchanged));
+        assert_eq!(app.display_range, (-1.0, 1.0));
+        assert!(app.rgba_up.is_empty(), "shown in sensor pixels");
+
+        // One pixel warms up by 3 K.
+        app.camera.inject(frame(30300, 2));
+        app.tick(&ctx);
+        let d = app.diff_stats.unwrap();
+        assert_eq!(d.max_pos, (80, 60));
+        assert!((d.max - 3.0).abs() < 1e-3 && d.min == 0.0, "{d:?}");
+        assert_eq!(px(&app, 0, 0), unchanged);
+        let warmer = px(&app, 80, 60);
+        assert!(warmer[0] > 200 && warmer[2] < 120, "{warmer:?}");
+        // What is measured is still the temperature.
+        let st = app.stats.unwrap();
+        assert!((app.frame.as_ref().unwrap().value(st.max) - 29.85).abs() < 0.01);
+        // The MP4 shows the same: signed bar labels, the reference in the caption and the
+        // marker on the largest rise.
+        let scene = app.video_scene(0.0).unwrap();
+        assert!(scene.signed && scene.caption.contains("차이 영상(기준 "));
+        assert!(scene.upscaled.is_none());
+        assert!(matches!(
+            &scene.marks[0],
+            Mark::Cross { at: (80, 60), text, .. } if text.starts_with("Δ+3.0")
+        ));
+        let png = app.take_snapshot(&CameraStatus::default()).unwrap();
+        let json = std::fs::read_to_string(png.with_extension("json")).unwrap();
+        assert!(json.contains("\"difference\": {"), "{json}");
+        assert!(json.contains("\"reference_local\""), "{json}");
+        // A chosen span instead of the automatic one.
+        app.settings.diff_span = 10.0;
+        app.render();
+        assert_eq!(app.display_range, (-10.0, 10.0));
+
+        // D turns it off: temperatures and the 4× image are back.
+        press(&ctx, &mut app, egui::Key::D);
+        assert!(app.diff.is_none() && app.diff_stats.is_none());
+        assert!(!app.rgba_up.is_empty());
+        assert!(app.display_range.0 > 20.0, "{:?}", app.display_range);
+        let png = app.take_snapshot(&CameraStatus::default()).unwrap();
+        let json = std::fs::read_to_string(png.with_extension("json")).unwrap();
+        assert!(json.contains("\"difference\": null"), "{json}");
+
+        // Another camera (another image size) ends it, with a message.
+        press(&ctx, &mut app, egui::Key::D);
+        assert!(app.diff.is_some());
+        app.camera.inject(frame_of(256, 192, 3));
+        app.tick(&ctx);
+        assert!(app.diff.is_none());
+        let msg = &app.message.as_ref().unwrap().0;
+        assert!(msg.contains("차이 영상을 껐습니다"), "{msg}");
+        // So does turning the image.
+        press(&ctx, &mut app, egui::Key::D);
+        app.set_rotation(Rotation::R180).unwrap();
+        assert!(app.diff.is_none());
         std::fs::remove_dir_all(&dir).ok();
     }
 

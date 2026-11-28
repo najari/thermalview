@@ -8,9 +8,9 @@ pub(crate) mod mf;
 pub mod overlay;
 
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, SyncSender, TrySendError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::thread::JoinHandle;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use overlay::Scene;
 
@@ -24,6 +24,12 @@ const BITRATE: u32 = 2_000_000;
 /// bounds the memory at roughly 100 MB when the encoder cannot keep up; further frames are
 /// skipped (and counted) instead of piling up.
 const BACKLOG: usize = 32;
+
+/// Longest wait for the writer to encode its backlog and finalize the file. Normally well under
+/// a second (32 frames at about 9 ms each, then the index). Once, a Media Foundation
+/// `WriteSample` call never returned (2026-11-28, not reproduced); without a limit, stopping
+/// the recording or closing the app would then hang forever.
+const FINISH_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Maps frame times (seconds on any clock) to MP4 sample times (100 ns units). The file starts
 /// at 0 and its times only go forward. When the clock jumps back (seeking back in a playback),
@@ -52,7 +58,9 @@ impl Timeline {
 pub struct Mp4Writer {
     path: PathBuf,
     tx: Option<SyncSender<(f64, Scene)>>,
-    thread: Option<JoinHandle<anyhow::Result<u64>>>,
+    thread: Option<JoinHandle<()>>,
+    /// The writer's result, sent as its last act.
+    done: Receiver<anyhow::Result<u64>>,
     size: (usize, usize),
     start: Instant,
     sent: u64,
@@ -71,45 +79,12 @@ impl Mp4Writer {
 
         let (tx, rx) = mpsc::sync_channel::<(f64, Scene)>(BACKLOG);
         let (ready_tx, ready_rx) = mpsc::sync_channel::<anyhow::Result<()>>(1);
+        let (done_tx, done) = mpsc::sync_channel::<anyhow::Result<u64>>(1);
         let file = path.clone();
         let thread = std::thread::Builder::new()
             .name("mp4-writer".into())
-            .spawn(move || -> anyhow::Result<u64> {
-                let mut enc =
-                    match mf::H264Writer::create(&file, cw as u32, ch as u32, NOMINAL_FPS, BITRATE)
-                    {
-                        Ok(enc) => {
-                            let _ = ready_tx.send(Ok(()));
-                            enc
-                        }
-                        Err(e) => {
-                            let msg = format!("{e:#}");
-                            let _ = ready_tx.send(Err(e));
-                            anyhow::bail!(msg);
-                        }
-                    };
-                let text = overlay::Text::load();
-                let mut nv12 = Vec::new();
-                let mut timeline = Timeline::default();
-                let mut n = 0u64;
-                for (t, scene) in rx {
-                    if (scene.width, scene.height) != (width, height) {
-                        continue;
-                    }
-                    let time = timeline.next(t);
-                    let cv = overlay::compose(&scene, &text);
-                    overlay::to_nv12(&cv, &mut nv12);
-                    enc.write(&nv12, time, FRAME_100NS)?;
-                    n += 1;
-                }
-                if n == 0 {
-                    // Media Foundation cannot finalize an MP4 without frames.
-                    drop(enc);
-                    let _ = std::fs::remove_file(&file);
-                    return Ok(0);
-                }
-                enc.finish()?;
-                Ok(n)
+            .spawn(move || {
+                let _ = done_tx.send(write(file, rx, ready_tx, width, height, cw, ch));
             })?;
 
         match ready_rx.recv() {
@@ -117,6 +92,7 @@ impl Mp4Writer {
                 path,
                 tx: Some(tx),
                 thread: Some(thread),
+                done,
                 size: (width, height),
                 start: Instant::now(),
                 sent: 0,
@@ -172,24 +148,87 @@ impl Mp4Writer {
 
     /// Finalize the file. Returns (path, frames written). With no frames there is no file.
     pub fn finish(mut self) -> anyhow::Result<(PathBuf, u64)> {
-        self.tx = None; // ends the writer loop
-        let n = match self.thread.take() {
-            Some(t) => t
-                .join()
-                .map_err(|_| anyhow::anyhow!("MP4 writer panicked"))??,
-            None => 0,
-        };
+        let n = self.end(FINISH_TIMEOUT)?;
         Ok((self.path.clone(), n))
+    }
+
+    /// End the writer loop and wait up to `limit` for its result. A writer stuck past that is
+    /// left behind (detached): the file is then not playable, but the caller goes on.
+    fn end(&mut self, limit: Duration) -> anyhow::Result<u64> {
+        self.tx = None;
+        let Some(thread) = self.thread.take() else {
+            return Ok(0);
+        };
+        match self.done.recv_timeout(limit) {
+            Ok(result) => {
+                let _ = thread.join();
+                result
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                let _ = thread.join();
+                anyhow::bail!("MP4 writer panicked")
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                log::error!("MP4 writer did not finish within {limit:?}; left running");
+                anyhow::bail!(
+                    "the encoder did not finish within {} s; the file is incomplete",
+                    limit.as_secs()
+                )
+            }
+        }
     }
 }
 
 impl Drop for Mp4Writer {
     fn drop(&mut self) {
-        self.tx = None;
-        if let Some(t) = self.thread.take() {
-            let _ = t.join();
-        }
+        let _ = self.end(FINISH_TIMEOUT);
     }
+}
+
+/// The writer thread: create the encoder (reporting success or failure on `ready`), encode every
+/// scene until the channel closes, then finalize. Returns the number of frames written.
+fn write(
+    file: PathBuf,
+    rx: Receiver<(f64, Scene)>,
+    ready: SyncSender<anyhow::Result<()>>,
+    width: usize,
+    height: usize,
+    cw: usize,
+    ch: usize,
+) -> anyhow::Result<u64> {
+    let mut enc = match mf::H264Writer::create(&file, cw as u32, ch as u32, NOMINAL_FPS, BITRATE) {
+        Ok(enc) => {
+            let _ = ready.send(Ok(()));
+            enc
+        }
+        Err(e) => {
+            let msg = format!("{e:#}");
+            let _ = ready.send(Err(e));
+            anyhow::bail!(msg);
+        }
+    };
+    let text = overlay::Text::load();
+    let mut nv12 = Vec::new();
+    let mut timeline = Timeline::default();
+    let mut n = 0u64;
+    for (t, scene) in rx {
+        if (scene.width, scene.height) != (width, height) {
+            continue;
+        }
+        let time = timeline.next(t);
+        let cv = overlay::compose(&scene, &text);
+        overlay::to_nv12(&cv, &mut nv12);
+        enc.write(&nv12, time, FRAME_100NS)?;
+        n += 1;
+    }
+    if n == 0 {
+        // Media Foundation cannot finalize an MP4 without frames.
+        drop(enc);
+        let _ = std::fs::remove_file(&file);
+        return Ok(0);
+    }
+    enc.finish()?;
+    Ok(n)
 }
 
 #[cfg(test)]
@@ -203,6 +242,7 @@ mod tests {
             rgba: [shade, 255 - shade, 128, 255].repeat(160 * 120),
             lut: (0..=255u8).map(|v| [v, 0, 255 - v]).collect(),
             range: (20.0, 40.0),
+            signed: false,
             band: None,
             unit: "°C",
             caption: "test".into(),
@@ -261,6 +301,35 @@ mod tests {
         // The same time again still moves forward.
         let again = tl.next(50.08);
         assert!(again > back + 800_000);
+    }
+
+    #[test]
+    fn a_stuck_writer_does_not_block_finishing() {
+        // A writer that never reports back, like a Media Foundation call that never returns.
+        let (_tx, rx) = mpsc::sync_channel::<(f64, Scene)>(1);
+        let (release, stuck) = mpsc::channel::<()>();
+        let (_done_tx, done) = mpsc::sync_channel(1);
+        let thread = std::thread::spawn(move || {
+            let _rx = rx;
+            let _ = stuck.recv();
+        });
+        let mut w = Mp4Writer {
+            path: PathBuf::from("stuck.mp4"),
+            tx: None,
+            thread: Some(thread),
+            done,
+            size: (160, 120),
+            start: Instant::now(),
+            sent: 0,
+            skipped: 0,
+        };
+        let t = Instant::now();
+        let err = w.end(Duration::from_millis(100)).unwrap_err().to_string();
+        assert!(err.contains("did not finish"), "{err}");
+        assert!(t.elapsed() < Duration::from_secs(5));
+        // Dropping it afterwards does not wait again.
+        drop(w);
+        release.send(()).unwrap();
     }
 
     #[test]

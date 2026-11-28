@@ -6,7 +6,7 @@ use eframe::egui::{self, Color32};
 use super::{calibration, view, webcam, Hold, ThermalApp};
 use crate::camera::{CameraStatus, ConnState, HEIGHT, WIDTH};
 use crate::remote::server::{Pending, Reply, Server};
-use crate::remote::{self as proto, IsoSet, RangeSet, Request};
+use crate::remote::{self as proto, DiffSet, IsoSet, RangeSet, Request};
 use crate::settings::RemoteSettings;
 use crate::thermal::alarm::Suspended;
 use crate::thermal::calibration::MIN_EMISSIVITY;
@@ -274,6 +274,20 @@ pub(super) fn execute(app: &mut ThermalApp, status: &CameraStatus, req: Request)
             app.render();
             Ok(isotherm_line(app))
         }
+        Request::Diff(None) => Ok(diff_line(app)),
+        Request::Diff(Some(set)) => {
+            match set {
+                DiffSet::On => app.set_diff(true)?,
+                DiffSet::Off => app.set_diff(false)?,
+                DiffSet::Span(span) => {
+                    app.settings.diff_span = span.unwrap_or(0.0);
+                    app.auto_range.reset();
+                    app.mark_dirty();
+                    app.render();
+                }
+            }
+            Ok(diff_line(app))
+        }
         Request::Filter(None) => Ok(app.settings.noise_filter.max(1).to_string()),
         Request::Filter(Some(n)) => {
             app.settings.noise_filter = n;
@@ -398,6 +412,26 @@ fn isotherm_line(app: &ThermalApp) -> String {
     }
 }
 
+/// "off", or "on span=2.00 min=-0.42 max=3.20 minpos=x,y maxpos=x,y ref=14:32:10": the color
+/// span, the largest drop and rise since the reference frame and where they are, and when the
+/// reference was taken.
+fn diff_line(app: &ThermalApp) -> String {
+    match (&app.diff, app.diff_stats) {
+        (Some(d), Some(st)) => format!(
+            "on span={} min={} max={} minpos={},{} maxpos={},{} ref={}",
+            num(app.display_range.1),
+            num(st.min),
+            num(st.max),
+            st.min_pos.0,
+            st.min_pos.1,
+            st.max_pos.0,
+            st.max_pos.1,
+            d.taken
+        ),
+        _ => "off".into(),
+    }
+}
+
 /// Magnification and the thermal pixel in the middle of the view.
 fn zoom_line(app: &ThermalApp) -> String {
     let (w, h) = dims(app);
@@ -431,6 +465,9 @@ fn alarms_line(app: &ThermalApp) -> String {
         Some(Suspended::NotRadiometric) => "counts",
     };
     let mut out = format!("enabled={} monitoring={monitoring}", on_off(cfg.enabled));
+    if app.alarms.auto_video() {
+        out.push_str(" mp4=alarm");
+    }
     for r in &cfg.rules {
         let state = if !r.enabled {
             "off"
@@ -620,6 +657,41 @@ mod tests {
         assert_eq!(run(&mut app, "ZOOM 2 0 0").unwrap(), "2.00 center=40,30");
         assert!(run(&mut app, "ZOOM 2 160 0").is_err());
         assert_eq!(run(&mut app, "ZOOM 1").unwrap(), "1.00 center=80,60");
+    }
+
+    #[test]
+    fn difference_image_commands() {
+        let mut app = rig();
+        assert_eq!(run(&mut app, "DIFF").unwrap(), "off");
+        let on = run(&mut app, "DIFF ON").unwrap();
+        let start = "on span=1.00 min=0.00 max=0.00 minpos=0,0 maxpos=0,0 ref=";
+        assert!(on.starts_with(start), "{on}");
+        // The hot pixel cools down by 4 K.
+        let f = app.frame.as_mut().unwrap();
+        f.raw[40 * 160 + 100] = 30600;
+        let st = f.stats();
+        app.stats = Some(st);
+        app.render();
+        let line = run(&mut app, "DIFF").unwrap();
+        assert!(
+            line.contains(" min=-4.00 max=0.00 minpos=100,40 "),
+            "{line}"
+        );
+        assert!(run(&mut app, "DIFF SPAN 5")
+            .unwrap()
+            .starts_with("on span=5.00 "));
+        assert_eq!(app.settings.diff_span, 5.0);
+        assert!(run(&mut app, "DIFF SPAN AUTO")
+            .unwrap()
+            .starts_with("on span=4.00 "));
+        // Temperatures are still what is measured.
+        assert!(run(&mut app, "MEAS").unwrap().contains(" max=32.85 "));
+        assert_eq!(run(&mut app, "DIFF OFF").unwrap(), "off");
+        assert!(run(&mut app, "RANGE").unwrap().starts_with("auto 26.85 "));
+
+        let mut empty = ThermalApp::with_camera(Settings::default(), Camera::disconnected());
+        assert!(run(&mut empty, "DIFF ON").is_err());
+        assert_eq!(run(&mut empty, "DIFF OFF").unwrap(), "off");
     }
 
     #[test]

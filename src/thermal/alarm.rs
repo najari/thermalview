@@ -94,27 +94,18 @@ impl Source {
 pub enum Condition {
     Above,
     Below,
+    /// Below `threshold` or above `upper`.
+    Outside,
 }
 
 impl Condition {
+    pub const ALL: [Condition; 3] = [Condition::Above, Condition::Below, Condition::Outside];
+
     pub fn label(self) -> &'static str {
         match self {
             Condition::Above => "이상",
             Condition::Below => "이하",
-        }
-    }
-
-    fn tripped(self, v: f32, threshold: f32) -> bool {
-        match self {
-            Condition::Above => v >= threshold,
-            Condition::Below => v <= threshold,
-        }
-    }
-
-    fn released(self, v: f32, threshold: f32, hysteresis: f32) -> bool {
-        match self {
-            Condition::Above => v <= threshold - hysteresis,
-            Condition::Below => v >= threshold + hysteresis,
+            Condition::Outside => "범위 밖",
         }
     }
 }
@@ -124,21 +115,104 @@ pub struct Rule {
     pub id: u32,
     pub enabled: bool,
     pub source: Source,
+    /// When set, the rule watches `source − minus` (a difference between two measurements).
+    #[serde(default)]
+    pub minus: Option<Source>,
     pub condition: Condition,
-    /// °C.
+    /// °C. The lower limit for [`Condition::Outside`].
     pub threshold: f32,
+    /// °C. Upper limit for [`Condition::Outside`]; unused otherwise.
+    #[serde(default)]
+    pub upper: f32,
 }
 
 impl Rule {
+    /// "S1 − S2".
+    pub fn subject(&self, shapes: &Shapes) -> String {
+        match self.minus {
+            Some(b) => format!("{} − {}", self.source.label(shapes), b.label(shapes)),
+            None => self.source.label(shapes),
+        }
+    }
+
     pub fn describe(&self, shapes: &Shapes) -> String {
-        format!(
-            "{} {:.1} °C {}",
-            self.source.label(shapes),
-            self.threshold,
-            self.condition.label()
+        let subject = self.subject(shapes);
+        match self.condition {
+            Condition::Outside => format!(
+                "{subject} {:.1}~{:.1} °C {}",
+                self.threshold,
+                self.upper,
+                self.condition.label()
+            ),
+            c => format!("{subject} {:.1} °C {}", self.threshold, c.label()),
+        }
+    }
+
+    /// The watched value: the measurement, or the difference of the two.
+    pub fn read(
+        &self,
+        f: &ThermalFrame,
+        st: &FrameStats,
+        spots: &Spots,
+        shapes: &Shapes,
+    ) -> Option<f32> {
+        let a = self.source.read(f, st, spots, shapes)?;
+        match self.minus {
+            Some(b) => Some(a - b.read(f, st, spots, shapes)?),
+            None => Some(a),
+        }
+    }
+
+    /// False once a measurement it reads has been deleted.
+    pub fn exists(&self, spots: &Spots, shapes: &Shapes) -> bool {
+        self.source.exists(spots, shapes) && self.minus.is_none_or(|b| b.exists(spots, shapes))
+    }
+
+    /// The limits in order, whichever way round they were typed.
+    fn band(&self) -> (f32, f32) {
+        (
+            self.threshold.min(self.upper),
+            self.threshold.max(self.upper),
+        )
+    }
+
+    fn tripped(&self, v: f32) -> bool {
+        match self.condition {
+            Condition::Above => v >= self.threshold,
+            Condition::Below => v <= self.threshold,
+            Condition::Outside => {
+                let (lo, hi) = self.band();
+                v < lo || v > hi
+            }
+        }
+    }
+
+    fn released(&self, v: f32, hysteresis: f32) -> bool {
+        match self.condition {
+            Condition::Above => v <= self.threshold - hysteresis,
+            Condition::Below => v >= self.threshold + hysteresis,
+            Condition::Outside => {
+                // A band narrower than twice the hysteresis clears at its middle.
+                let (lo, hi) = self.band();
+                let h = hysteresis.min((hi - lo) / 2.0);
+                v >= lo + h && v <= hi - h
+            }
+        }
+    }
+
+    /// What the evaluation depends on: changing any of it starts the rule over.
+    fn key(&self) -> RuleKey {
+        (
+            self.source,
+            self.minus,
+            self.condition,
+            self.threshold.to_bits(),
+            self.upper.to_bits(),
         )
     }
 }
+
+type RuleKey = (Source, Option<Source>, Condition, u32, u32);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -151,6 +225,12 @@ pub struct AlarmConfig {
     pub hysteresis: f32,
     /// Save a snapshot when an alarm is raised.
     pub snapshot_on_raise: bool,
+    /// Record an MP4 while an alarm is active, and for `record_after_s` seconds after the last
+    /// one clears.
+    pub record_on_raise: bool,
+    pub record_after_s: f32,
+    /// Append every raise and clear to `alarm_log.csv` in the save folder.
+    pub log_to_file: bool,
     next_id: u32,
 }
 
@@ -162,6 +242,9 @@ impl Default for AlarmConfig {
             hold_s: 1.0,
             hysteresis: 0.5,
             snapshot_on_raise: false,
+            record_on_raise: false,
+            record_after_s: 10.0,
+            log_to_file: false,
             next_id: 0,
         }
     }
@@ -179,8 +262,10 @@ impl AlarmConfig {
             id: self.next_id,
             enabled: true,
             source,
+            minus: None,
             condition,
             threshold,
+            upper: threshold + 10.0,
         });
         Some(self.next_id)
     }
@@ -193,7 +278,7 @@ impl AlarmConfig {
     /// could otherwise start watching a different spot. Returns how many were removed.
     pub fn prune(&mut self, spots: &Spots, shapes: &Shapes) -> usize {
         let before = self.rules.len();
-        self.rules.retain(|r| r.source.exists(spots, shapes));
+        self.rules.retain(|r| r.exists(spots, shapes));
         before - self.rules.len()
     }
 
@@ -242,7 +327,7 @@ enum Phase {
 #[derive(Debug, Clone, Copy)]
 struct RuleState {
     /// Editing what the rule measures restarts its evaluation.
-    key: (Source, Condition, u32),
+    key: RuleKey,
     phase: Phase,
     value: f32,
 }
@@ -283,7 +368,7 @@ impl Monitor {
         &mut self,
         cfg: &AlarmConfig,
         t: f64,
-        mut read: impl FnMut(Source) -> Option<f32>,
+        mut read: impl FnMut(&Rule) -> Option<f32>,
     ) -> Vec<Transition> {
         if self.suspended.is_some() || !cfg.enabled {
             self.states.clear();
@@ -296,11 +381,11 @@ impl Monitor {
         let hysteresis = cfg.hysteresis.max(0.0);
         let mut out = Vec::new();
         for r in cfg.rules.iter().filter(|r| r.enabled) {
-            let Some(v) = read(r.source) else {
+            let Some(v) = read(r) else {
                 self.states.remove(&r.id);
                 continue;
             };
-            let key = (r.source, r.condition, r.threshold.to_bits());
+            let key = r.key();
             let state = self.states.entry(r.id).or_insert(RuleState {
                 key,
                 phase: Phase::Clear,
@@ -312,10 +397,10 @@ impl Monitor {
             }
             state.value = v;
 
-            let tripped = r.condition.tripped(v, r.threshold);
+            let tripped = r.tripped(v);
             match state.phase {
                 Phase::Active => {
-                    if r.condition.released(v, r.threshold, hysteresis) {
+                    if r.released(v, hysteresis) {
                         state.phase = Phase::Clear;
                         out.push(Transition {
                             rule_id: r.id,
@@ -351,6 +436,10 @@ impl Monitor {
         self.states
             .get(&id)
             .is_some_and(|s| s.phase == Phase::Active)
+    }
+
+    pub fn any_active(&self) -> bool {
+        self.states.values().any(|s| s.phase == Phase::Active)
     }
 
     /// The condition is met and the hold time is running.
@@ -581,12 +670,92 @@ mod tests {
     }
 
     #[test]
+    fn outside_raises_on_both_sides_and_clears_inside_the_band() {
+        let (mut c, id) = config(Condition::Outside, 20.0);
+        c.rules[0].upper = 30.0;
+        let mut m = running();
+        assert!(step(&mut m, &c, 0.0, 25.0).is_empty());
+        step(&mut m, &c, 1.0, 31.0);
+        assert_eq!(step(&mut m, &c, 2.0, 31.0).len(), 1);
+        // Back inside but within the 0.5 °C band of the edge: still alarmed.
+        assert!(step(&mut m, &c, 3.0, 29.8).is_empty());
+        assert!(m.is_active(id));
+        assert_eq!(step(&mut m, &c, 4.0, 29.5).len(), 1);
+        assert!(!m.is_active(id));
+        // The low side, with the limits typed the wrong way round.
+        c.rules[0].threshold = 30.0;
+        c.rules[0].upper = 20.0;
+        step(&mut m, &c, 5.0, 19.0);
+        assert_eq!(step(&mut m, &c, 6.0, 19.0).len(), 1);
+        assert!(step(&mut m, &c, 7.0, 20.4).is_empty());
+        assert_eq!(step(&mut m, &c, 8.0, 20.5).len(), 1);
+        assert_eq!(
+            c.rules[0].describe(&Shapes::default()),
+            "화면 최고 30.0~20.0 °C 범위 밖"
+        );
+    }
+
+    #[test]
+    fn a_narrow_band_clears_at_its_middle() {
+        let (mut c, id) = config(Condition::Outside, 20.0);
+        c.rules[0].upper = 20.5;
+        let mut m = running();
+        step(&mut m, &c, 0.0, 21.0);
+        step(&mut m, &c, 1.0, 21.0);
+        assert!(m.is_active(id));
+        assert!(step(&mut m, &c, 2.0, 20.3).is_empty());
+        assert_eq!(
+            step(&mut m, &c, 3.0, 20.25).len(),
+            1,
+            "clears at the middle"
+        );
+    }
+
+    #[test]
+    fn a_rule_can_watch_a_difference() {
+        // 3×3 frame, 0..8 °C; S1 at the center reads 4 °C.
+        let f = ThermalFrame::new(3, 3, (0..9).map(|v| 27315 + v * 100).collect(), Some(0.01));
+        let st = f.stats();
+        let mut spots = Spots::default();
+        let s = spots.add(1, 1).unwrap();
+        let shapes = Shapes::default();
+        let mut c = AlarmConfig::default();
+        let id = c.add(SRC, Condition::Above, 3.0).unwrap();
+        c.rules[0].minus = Some(Source::Spot(s));
+        assert_eq!(c.rules[0].describe(&shapes), "화면 최고 − S1 3.0 °C 이상");
+        let v = c.rules[0].read(&f, &st, &spots, &shapes).unwrap();
+        assert!((v - 4.0).abs() < 1e-2, "{v}");
+
+        let mut m = running();
+        let read = |r: &Rule| r.read(&f, &st, &spots, &shapes);
+        m.update(&c, 0.0, read);
+        assert_eq!(m.update(&c, 1.0, read).len(), 1);
+        assert!(m.is_active(id) && m.any_active());
+        // Changing what is subtracted starts the rule over.
+        c.rules[0].minus = Some(Source::Center);
+        assert!(m.update(&c, 1.1, read).is_empty());
+        assert!(!m.is_active(id));
+
+        // Deleting the subtracted spot deletes the rule.
+        c.rules[0].minus = Some(Source::Spot(s));
+        spots.remove(s);
+        assert_eq!(c.prune(&spots, &shapes), 1);
+    }
+
+    #[test]
     fn config_survives_json() {
-        let (c, _) = config(Condition::Below, 12.5);
+        let (mut c, _) = config(Condition::Below, 12.5);
+        c.rules[0].minus = Some(Source::Center);
         let back: AlarmConfig = serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
         assert_eq!(back.rules, c.rules);
         let partial: AlarmConfig = serde_json::from_str("{}").unwrap();
         assert!(partial.enabled);
         assert_eq!(partial.hold_s, 1.0);
+        assert_eq!(partial.record_after_s, 10.0);
+        // A rule saved before differences and ranges existed.
+        let old = r#"{"rules":[{"id":3,"enabled":true,"source":"Center","condition":"Above","threshold":40.0}]}"#;
+        let old: AlarmConfig = serde_json::from_str(old).unwrap();
+        assert_eq!(old.rules[0].minus, None);
+        assert_eq!(old.rules[0].threshold, 40.0);
     }
 }

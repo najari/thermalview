@@ -40,13 +40,16 @@
 | `RANGE AUTO` / `RANGE ROBUST` / `RANGE lo hi` | `OK manual 20.00 40.00` | 자동 범위 / 가장 차갑고 뜨거운 화소 1 %씩을 뺀 자동 범위(`robust`) / 수동 범위 |
 | `ISOTHERM` | `OK above 60.00 pixels=3.9%` 또는 `OK off` | 등온선 상태와 지금 영상에서 해당하는 화소 비율 |
 | `ISOTHERM ABOVE t` / `BELOW t` / `BETWEEN lo hi` / `OFF` | `OK between 30.00 35.00 pixels=12.0%` | 기준 이상·이하·구간의 화소를 한 색으로 칠함(화면, 스냅샷 컬러 PNG, MP4). 측정값은 바뀌지 않음. 색은 화면에서 고름 |
+| `DIFF` | `OK on span=2.00 min=-0.45 max=3.20 minpos=176,185 maxpos=116,1 ref=15:09:40` 또는 `OK off` | 차이 영상 상태: 색 범위(±span), 기준 영상보다 가장 많이 내려간 값·올라간 값과 그 위치, 기준을 잡은 시각 |
+| `DIFF ON` / `DIFF OFF` | 위와 같음 | 지금 프레임을 기준으로 잡고 그 뒤 달라진 만큼을 색으로 보여 줌(다시 보내면 기준을 새로 잡음) / 끔. 화면·스냅샷 컬러 PNG·MP4만 바뀌고 `MEAS`·`TEMP`·`FRAME`·CSV·경보는 계속 온도 |
+| `DIFF SPAN x` / `DIFF SPAN AUTO` | 위와 같음 | 색 범위를 ±x(0.1~1000)로 고정 / 영상의 가장 큰 차이에 맞춤 |
 | `FILTER [n]` | `OK 8` | 잡음 필터 세기 읽기·바꾸기: `1`(또는 `OFF`) 끔, `2`, `4`, `8`, `16`프레임 평균. 켜면 `MEAS`·`TEMP`·`FRAME`·CSV·경보가 필터를 거친 값. `.tvseq` 녹화에는 필터 전 원본이 저장됨 |
 | `FREEZE` | `OK off` | 화면 정지 여부 |
 | `FREEZE ON` / `FREEZE OFF` | `OK on` | 지금 프레임을 붙잡아 둠 / 실시간으로 돌아감. 정지 동안 카메라 프레임은 버려지고 `MEAS`·`TEMP`·`FRAME`·`SNAPSHOT`은 붙잡은 프레임을 대상으로 함. CSV·녹화·MP4 기록 중이거나 재생 중에는 `ERR`, 정지 중 `CSV START`·`REC START`·`MP4 START`도 `ERR`. 경보 감시는 정지 동안 중단(`ALARMS`의 `monitoring=frozen`). 다시 연 스냅샷에서 `FREEZE OFF`를 보내면 스냅샷을 닫고 실시간으로 돌아감 |
 | `ZOOM [배율 [x y]]` | `OK 2.50 center=110,80` | 영상 보기의 확대 배율(1~8)과 화면 가운데의 화소. `x y`를 주면 그 화소를 가운데로(가장자리에서는 영상 끝에 맞춤). 화면에만 적용되고 스냅샷·MP4는 항상 전체 영상 |
 | `ROTATE [도]` | `OK 90` | 실시간 영상 회전 읽기·바꾸기(시계 방향 0, 90, 180, 270). 측정점·영역도 같은 장면 위치로 옮겨짐. 재생 중과 CSV·녹화·MP4 기록 중에는 바꿀 수 없음 |
 | `EMISSIVITY [e]` | `OK 0.950` | 방사율 읽기·바꾸기(0.10~1.00). CSV 기록 중에는 바꿀 수 없음 |
-| `ALARMS` | `OK enabled=on monitoring=on R1=active R2=clear` | 경보 감시 상태(`on`, `playback`, `frozen`, `nosignal`, `counts`)와 규칙별 상태(`active`, `pending`, `clear`, `off`) |
+| `ALARMS` | `OK enabled=on monitoring=on R1=active R2=clear` | 경보 감시 상태(`on`, `playback`, `frozen`, `nosignal`, `counts`)와 규칙별 상태(`active`, `pending`, `clear`, `off`). 경보가 시작한 MP4가 녹화 중이면 `mp4=alarm`이 붙음(멈추는 것은 `MP4 STOP`으로 직접 해도 됨) |
 | `SNAPSHOT` | `OK C:\...\thermal_20261125_100417_368.png` | 스냅샷 저장(컬러 PNG, 16비트 PNG, JSON). 컬러 PNG 경로를 돌려줌 |
 | `CSV START` / `CSV STOP` | `OK C:\...\thermal_log_....csv` / `OK rows=86 C:\...` | 측정값 CSV 기록 |
 | `REC START` / `REC STOP` | `OK C:\...\thermal_seq_....tvseq` / `OK frames=169 C:\...` | 온도 원본 녹화. 재생 중에는 시작할 수 없음 |
@@ -67,8 +70,6 @@
 - 응답 시간: 창이 보일 때 약 1~50 ms, 최소화했을 때 약 100 ms.
 - 앱이 3초 안에 응답하지 못하면 `ERR application not responding`을 돌려줍니다.
 - 재생 중에는 `MEAS`, `FRAME`, `SNAPSHOT`이 재생 중인 프레임을 대상으로 합니다(`STATUS`의 `source=playback`). 화면 정지나 다시 연 스냅샷에서는 화면에 붙잡혀 있는 프레임이 대상입니다(`source=frozen`, `source=snapshot`).
-- 웹캠 합성과 4배 업스케일을 함께 켠 채 `MP4 STOP`을 보내면 마무리가 3초를 넘겨 `ERR application not responding`이 올 수 있습니다. 파일은 저장되므로 `STATUS`의 `mp4=off`로 확인하세요.
-
 ## 예
 
 PowerShell:

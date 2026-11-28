@@ -249,26 +249,30 @@ pub(super) fn image_view(ui: &mut egui::Ui, app: &mut ThermalApp) -> bool {
         }
     }
 
-    // Max / min markers.
+    // Max / min markers: of the temperatures, or of the differences in a difference image
+    // (where it warmed up and cooled down the most).
     if app.settings.show_extremes {
-        for (pos, v, color) in [
-            (st.max_pos, f.value(st.max), Color32::from_rgb(255, 60, 60)),
-            (st.min_pos, f.value(st.min), Color32::from_rgb(80, 160, 255)),
-        ] {
+        let (red, blue) = (
+            Color32::from_rgb(255, 60, 60),
+            Color32::from_rgb(80, 160, 255),
+        );
+        let marks = match app.diff_stats {
+            Some(d) => [
+                (d.max_pos, format!("Δ{:+.1}{unit}", d.max), red),
+                (d.min_pos, format!("Δ{:+.1}{unit}", d.min), blue),
+            ],
+            None => [
+                (st.max_pos, format!("{:.1}{unit}", f.value(st.max)), red),
+                (st.min_pos, format!("{:.1}{unit}", f.value(st.min)), blue),
+            ],
+        };
+        for (pos, text, color) in marks {
             let c = to_screen(pos.0, pos.1);
             if !in_view(c) {
                 continue;
             }
             cross(&painter, c, 7.0, color);
-            label(
-                &painter,
-                c,
-                vec2(9.0, -9.0),
-                img_rect,
-                &format!("{v:.1}{unit}"),
-                &font,
-                color,
-            );
+            label(&painter, c, vec2(9.0, -9.0), img_rect, &text, &font, color);
         }
     }
 
@@ -364,7 +368,10 @@ pub(super) fn image_view(ui: &mut egui::Ui, app: &mut ThermalApp) -> bool {
 
     // Hover readout.
     if let Some((x, y)) = resp.hover_pos().and_then(to_pixel) {
-        let txt = format!("({x}, {y})  {:.2} {unit}", f.value(f.at(x, y)));
+        let mut txt = format!("({x}, {y})  {:.2} {unit}", f.value(f.at(x, y)));
+        if let Some(d) = app.diff_values.get(y * f.width + x) {
+            txt.push_str(&format!("  Δ {d:+.2}"));
+        }
         label(
             &painter,
             img_rect.left_bottom(),
@@ -422,10 +429,15 @@ pub(super) fn image_view(ui: &mut egui::Ui, app: &mut ThermalApp) -> bool {
             4 => Align2::LEFT_BOTTOM,
             _ => Align2::LEFT_CENTER,
         };
+        // Differences carry their sign.
+        let text = match app.diff_stats {
+            Some(_) => format!("{v:+.1}{unit}"),
+            None => format!("{v:.1}{unit}"),
+        };
         painter.text(
             pos2(bar.max.x + 6.0, y),
             align,
-            format!("{v:.1}{unit}"),
+            text,
             font.clone(),
             text_color,
         );
