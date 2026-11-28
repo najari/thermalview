@@ -8,7 +8,7 @@ pub mod server;
 
 use crate::thermal::filter::Temporal;
 use crate::thermal::palette::Palette;
-use crate::thermal::rotate::Rotation;
+use crate::thermal::rotate::{Flip, Rotation};
 
 /// Longest accepted command line, in bytes (without the line ending).
 pub const MAX_LINE: usize = 256;
@@ -72,6 +72,8 @@ pub enum Request {
     Range(Option<RangeSet>),
     /// Clockwise turn of the live image.
     Rotate(Option<Rotation>),
+    /// Mirroring of the live image (after the rotation).
+    Flip(Option<Flip>),
     Emissivity(Option<f32>),
     Alarms,
     Snapshot,
@@ -98,7 +100,7 @@ pub enum Request {
 
 pub const HELP: &str = "commands: STATUS | MEAS | TEMP x y | SPOT [LIST|ADD x y|DEL id|CLEAR] | \
 PALETTE [name] | RANGE [AUTO|ROBUST|lo hi] | ISOTHERM [OFF|ABOVE t|BELOW t|BETWEEN lo hi] | DIFF [ON|OFF|SPAN AUTO|SPAN x] | \
-FILTER [1|2|4|8|16] | ROTATE [0|90|180|270] | EMISSIVITY [e] | ALARMS | FREEZE [ON|OFF] | ZOOM [factor [x y]] | \
+FILTER [1|2|4|8|16] | ROTATE [0|90|180|270] | FLIP [NONE|H|V|HV] | EMISSIVITY [e] | ALARMS | FREEZE [ON|OFF] | ZOOM [factor [x y]] | \
 SNAPSHOT | CSV START|STOP | REC START|STOP | MP4 START|STOP | FRAME | ALIGN | SCREENSHOT | QUIT";
 
 /// Parse one command line (case-insensitive, words separated by spaces).
@@ -178,6 +180,8 @@ pub fn parse(line: &str) -> Result<Request, String> {
         }
         ["ROTATE"] => Request::Rotate(None),
         ["ROTATE", deg] => Request::Rotate(Some(rotation(deg)?)),
+        ["FLIP"] => Request::Flip(None),
+        ["FLIP", f] => Request::Flip(Some(flip(f)?)),
         ["EMISSIVITY"] => Request::Emissivity(None),
         ["EMISSIVITY", e] => Request::Emissivity(Some(number(e)?)),
         ["ALARMS"] => Request::Alarms,
@@ -208,6 +212,7 @@ pub fn parse(line: &str) -> Result<Request, String> {
                 "FREEZE",
                 "ZOOM",
                 "ROTATE",
+                "FLIP",
                 "EMISSIVITY",
                 "ALARMS",
                 "SNAPSHOT",
@@ -244,6 +249,27 @@ fn rotation(s: &str) -> Result<Rotation, String> {
         .into_iter()
         .find(|r| s.parse() == Ok(rotation_degrees(*r)))
         .ok_or_else(|| format!("rotation {s}: use 0, 90, 180 or 270"))
+}
+
+/// NONE, H, V or HV, as the remote protocol writes a flip.
+pub fn flip_name(f: Flip) -> &'static str {
+    match (f.h, f.v) {
+        (false, false) => "NONE",
+        (true, false) => "H",
+        (false, true) => "V",
+        (true, true) => "HV",
+    }
+}
+
+fn flip(s: &str) -> Result<Flip, String> {
+    let (h, v) = match s {
+        "NONE" | "OFF" => (false, false),
+        "H" => (true, false),
+        "V" => (false, true),
+        "HV" | "VH" => (true, true),
+        _ => return Err(format!("flip {s}: use NONE, H, V or HV")),
+    };
+    Ok(Flip { h, v })
 }
 
 /// Largest magnification of the image view.
@@ -370,6 +396,15 @@ mod tests {
         );
         assert_eq!(parse("ROTATE"), Ok(Request::Rotate(None)));
         assert!(parse("ROTATE 45").unwrap_err().contains("270"));
+        assert_eq!(parse("FLIP"), Ok(Request::Flip(None)));
+        assert_eq!(
+            parse("flip hv"),
+            Ok(Request::Flip(Some(Flip { h: true, v: true })))
+        );
+        assert_eq!(parse("FLIP NONE"), Ok(Request::Flip(Some(Flip::NONE))));
+        assert!(parse("FLIP X").unwrap_err().contains("NONE, H, V or HV"));
+        assert!(parse("FLIP H V").unwrap_err().starts_with("bad arguments"));
+        assert_eq!(flip_name(Flip { h: false, v: true }), "V");
         assert!(parse("FFC").unwrap_err().starts_with("unknown command"));
         assert!(parse("CSV").unwrap_err().starts_with("bad arguments"));
     }

@@ -1,4 +1,4 @@
-//! Area (Box) and Line measurements.
+//! Area (Box, Ellipse) and Line measurements.
 
 use serde::{Deserialize, Serialize};
 
@@ -8,6 +8,15 @@ use super::frame::ThermalFrame;
 pub enum ShapeKind {
     Box,
     Line,
+    /// The ellipse inscribed in the box from `a` to `b`: the pixels whose centers lie inside.
+    Ellipse,
+}
+
+impl ShapeKind {
+    /// Covers an area (edited by its bounding box), as opposed to a line.
+    pub fn is_area(self) -> bool {
+        matches!(self, ShapeKind::Box | ShapeKind::Ellipse)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -63,10 +72,30 @@ impl Shape {
         match self.kind {
             ShapeKind::Box => format!("B{}", self.id),
             ShapeKind::Line => format!("L{}", self.id),
+            ShapeKind::Ellipse => format!("E{}", self.id),
         }
     }
 
-    /// Pixels covered: every pixel of the rectangle, or the Bresenham line from a to b.
+    /// Whether pixel (x, y) belongs to the ellipse inscribed in this shape's box (as drawn,
+    /// before clamping to a frame). Always true for the center pixel of the box.
+    fn in_ellipse(&self, x: usize, y: usize) -> bool {
+        let (x0, x1) = (
+            self.a.0.min(self.b.0) as f32,
+            self.a.0.max(self.b.0) as f32 + 1.0,
+        );
+        let (y0, y1) = (
+            self.a.1.min(self.b.1) as f32,
+            self.a.1.max(self.b.1) as f32 + 1.0,
+        );
+        let (rx, ry) = ((x1 - x0) / 2.0, (y1 - y0) / 2.0);
+        let dx = (x as f32 + 0.5 - (x0 + rx)) / rx;
+        let dy = (y as f32 + 0.5 - (y0 + ry)) / ry;
+        // The small margin keeps the four extreme pixels of an odd-sized ellipse.
+        dx * dx + dy * dy <= 1.0 + 1e-4
+    }
+
+    /// Pixels covered: every pixel of the rectangle or ellipse, or the Bresenham line from a
+    /// to b. Parts outside a w×h frame are left out (a line is clamped to its edge).
     pub fn pixels(&self, w: usize, h: usize) -> Vec<(usize, usize)> {
         let clamp =
             |(x, y): (usize, usize)| (x.min(w.saturating_sub(1)), y.min(h.saturating_sub(1)));
@@ -77,6 +106,14 @@ impl Shape {
                 let (y0, y1) = (a.1.min(b.1), a.1.max(b.1));
                 (y0..=y1)
                     .flat_map(|y| (x0..=x1).map(move |x| (x, y)))
+                    .collect()
+            }
+            ShapeKind::Ellipse => {
+                let (x0, x1) = (a.0.min(b.0), a.0.max(b.0));
+                let (y0, y1) = (a.1.min(b.1), a.1.max(b.1));
+                (y0..=y1)
+                    .flat_map(|y| (x0..=x1).map(move |x| (x, y)))
+                    .filter(|&(x, y)| self.in_ellipse(x, y))
                     .collect()
             }
             ShapeKind::Line => bresenham(a, b),
@@ -112,12 +149,15 @@ impl Shape {
         match self.kind {
             // Rows directly: this runs for every frame, and a pixel list of a large box is
             // hundreds of kilobytes.
-            ShapeKind::Box => {
+            ShapeKind::Box | ShapeKind::Ellipse => {
                 let clamp = |(x, y): (usize, usize)| (x.min(f.width - 1), y.min(f.height - 1));
                 let (a, b) = (clamp(self.a), clamp(self.b));
+                let ellipse = self.kind == ShapeKind::Ellipse;
                 for y in a.1.min(b.1)..=a.1.max(b.1) {
                     for x in a.0.min(b.0)..=a.0.max(b.0) {
-                        add(x, y);
+                        if !ellipse || self.in_ellipse(x, y) {
+                            add(x, y);
+                        }
                     }
                 }
             }
@@ -151,11 +191,11 @@ impl Shape {
             .collect()
     }
 
-    /// Box with `a` top-left and `b` bottom-right; lines are unchanged (their direction matters).
+    /// Area with `a` top-left and `b` bottom-right; lines are unchanged (their direction matters).
     pub fn normalized(&self) -> Shape {
         match self.kind {
             ShapeKind::Line => *self,
-            ShapeKind::Box => Shape {
+            ShapeKind::Box | ShapeKind::Ellipse => Shape {
                 a: (self.a.0.min(self.b.0), self.a.1.min(self.b.1)),
                 b: (self.a.0.max(self.b.0), self.a.1.max(self.b.1)),
                 ..*self
@@ -163,8 +203,9 @@ impl Shape {
         }
     }
 
-    /// What a drag starting at (x, y) would edit. Line: an endpoint, or the whole line. Box: a
-    /// corner or edge, or (with `interior`) the whole box when grabbed inside.
+    /// What a drag starting at (x, y) would edit. Line: an endpoint, or the whole line. Box and
+    /// Ellipse: a corner or edge of the (bounding) box, or (with `interior`) the whole shape
+    /// when grabbed inside that box.
     pub fn grab_at(&self, x: f32, y: f32, tol: f32, interior: bool) -> Option<Grab> {
         let s = self.normalized();
         match s.kind {
@@ -181,7 +222,7 @@ impl Shape {
                     None
                 }
             }
-            ShapeKind::Box => {
+            ShapeKind::Box | ShapeKind::Ellipse => {
                 // The outline runs along pixel edges.
                 let (x0, y0) = (s.a.0 as f32, s.a.1 as f32);
                 let (x1, y1) = (s.b.0 as f32 + 1.0, s.b.1 as f32 + 1.0);
@@ -259,6 +300,20 @@ impl Shape {
                     let dx = (x0 - x).max(x - x1).max(0.0);
                     let dy = (y0 - y).max(y - y1).max(0.0);
                     (dx * dx + dy * dy).sqrt()
+                }
+            }
+            ShapeKind::Ellipse => {
+                // Outline along pixel edges, as drawn.
+                let (x0, x1) = (ax.min(bx) - 0.5, ax.max(bx) + 0.5);
+                let (y0, y1) = (ay.min(by) - 0.5, ay.max(by) + 0.5);
+                let (rx, ry) = ((x1 - x0) / 2.0, (y1 - y0) / 2.0);
+                let (px, py) = (x - (x0 + rx), y - (y0 + ry));
+                let r = ((px / rx).powi(2) + (py / ry).powi(2)).sqrt();
+                if r <= 1.0 {
+                    0.0
+                } else {
+                    // Along the ray from the center: close enough for picking.
+                    px.hypot(py) * (1.0 - 1.0 / r)
                 }
             }
         }
@@ -392,6 +447,79 @@ mod tests {
         assert!((st.min - 11.0).abs() < 1e-3 && st.min_pos == (1, 1));
         assert!((st.max - 22.0).abs() < 1e-3 && st.max_pos == (2, 2));
         assert!((st.mean - 16.5).abs() < 1e-3);
+    }
+
+    #[test]
+    fn ellipse_pixels_and_stats() {
+        let e = |a, b| Shape {
+            id: 3,
+            kind: ShapeKind::Ellipse,
+            a,
+            b,
+        };
+        // A 5×5 circle: 21 pixels (the 5×5 square without its four corners).
+        let c = e((4, 4), (0, 0));
+        let px = c.pixels(10, 10);
+        assert_eq!(px.len(), 21);
+        for corner in [(0, 0), (4, 0), (0, 4), (4, 4)] {
+            assert!(!px.contains(&corner));
+        }
+        for edge in [(2, 0), (0, 2), (4, 2), (2, 4), (2, 2)] {
+            assert!(px.contains(&edge), "{edge:?}");
+        }
+        // One pixel, a one-pixel-high strip and a 2×2 square are all kept whole.
+        assert_eq!(e((1, 1), (1, 1)).pixels(4, 3), vec![(1, 1)]);
+        assert_eq!(e((0, 1), (3, 1)).pixels(4, 3).len(), 4);
+        assert_eq!(e((0, 0), (1, 1)).pixels(4, 3).len(), 4);
+        // Partly outside the frame: only the inside part, no wrapping onto the edge.
+        let big = e((2, 1), (7, 6)); // 6×6 circle centred at (5, 4) on a 4×3 frame
+        let inside = big.pixels(4, 3);
+        assert!(inside.iter().all(|&(x, y)| x < 4 && y < 3));
+        assert!(
+            !inside.contains(&(2, 1)),
+            "outside the circle, though inside the box"
+        );
+        assert!(inside.contains(&(3, 2)));
+
+        let f = ramp(); // value = 10*y + x
+                        // 4×3 ellipse over the whole frame: the four corner pixels fall outside.
+        let st = e((0, 0), (3, 2)).stats(&f).unwrap();
+        assert_eq!(st.pixels, 8);
+        assert!((st.mean - 11.5).abs() < 1e-3, "{}", st.mean);
+        assert_eq!((st.min_pos, st.max_pos), ((1, 0), (2, 2)));
+        assert_eq!(e((0, 0), (2, 2)).label(), "E3");
+        let st2 = big.stats(&f).unwrap();
+        assert_eq!(st2.pixels, inside.len());
+    }
+
+    #[test]
+    fn ellipse_grabbing_and_hits() {
+        let mut s = Shapes::default();
+        let id = s.add(ShapeKind::Ellipse, (20, 10), (40, 30)).unwrap();
+        // Edited like a box, by its bounding box.
+        assert_eq!(
+            s.items[0].grab_at(41.0, 20.0, 1.0, false),
+            Some(Grab {
+                ax: false,
+                ay: false,
+                bx: true,
+                by: false
+            })
+        );
+        assert_eq!(s.items[0].grab_at(30.0, 20.0, 1.0, true), Some(Grab::MOVE));
+        // Hit inside the ellipse, near its outline, but not in the corner of the box.
+        assert_eq!(s.hit(30.5, 20.5, 1.0), Some(id));
+        assert_eq!(s.hit(42.0, 20.5, 1.5), Some(id));
+        assert_eq!(s.hit(21.0, 11.0, 1.5), None);
+        assert!(ShapeKind::Ellipse.is_area() && !ShapeKind::Line.is_area());
+        let n = Shape {
+            id: 1,
+            kind: ShapeKind::Ellipse,
+            a: (9, 9),
+            b: (1, 2),
+        }
+        .normalized();
+        assert_eq!((n.a, n.b), ((1, 2), (9, 9)));
     }
 
     #[test]

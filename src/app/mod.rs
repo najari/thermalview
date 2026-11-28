@@ -19,9 +19,11 @@ use crate::camera::lepton::ShutterMode;
 use crate::camera::{Camera, CameraStatus, Command, ConnState, Kind, Source};
 use crate::settings::{Layout, Settings};
 use crate::storage::csv_log::{self, CsvLog};
+use crate::storage::report;
 use crate::storage::sequence::{self, SeqHeader, SeqWriter};
 use crate::storage::snapshot::{
-    self, DeltaReading, DifferenceInfo, ShapeReading, SnapshotMeta, SpotReading, WebcamInfo,
+    self, DeltaReading, DifferenceInfo, SavedMarks, ShapeReading, SnapshotMeta, SpotReading,
+    WebcamInfo,
 };
 use crate::thermal::alarm::{Metric, Source as Reading};
 use crate::thermal::delta::{Delta, Deltas};
@@ -32,7 +34,7 @@ use crate::thermal::history::{History, Sample};
 use crate::thermal::isotherm::Band;
 use crate::thermal::palette::{self, Palette};
 use crate::thermal::range::{self, AutoRange, RangeMode};
-use crate::thermal::rotate::Rotation;
+use crate::thermal::rotate::{Flip, Rotation};
 use crate::thermal::shapes::{Grab, Shape, ShapeKind};
 use crate::thermal::upscale::{self, Sharpen, Upscaler};
 use crate::video::Mp4Writer;
@@ -79,6 +81,7 @@ pub enum Tool {
     Spot,
     Box,
     Line,
+    Ellipse,
 }
 
 impl Tool {
@@ -87,6 +90,7 @@ impl Tool {
             Tool::Spot => None,
             Tool::Box => Some(ShapeKind::Box),
             Tool::Line => Some(ShapeKind::Line),
+            Tool::Ellipse => Some(ShapeKind::Ellipse),
         }
     }
 }
@@ -149,6 +153,9 @@ pub struct ThermalApp {
     filter_t: Option<f64>,
     /// When set, the image is held and camera frames are dropped.
     hold: Option<Hold>,
+    /// Measurements stored with the open snapshot, and whether to draw them.
+    saved_marks: SavedMarks,
+    show_saved_marks: bool,
     zoom: view::Zoom,
 
     confirm_ffc: bool,
@@ -241,6 +248,8 @@ impl ThermalApp {
             filter: Temporal::default(),
             filter_t: None,
             hold: None,
+            saved_marks: SavedMarks::default(),
+            show_saved_marks: true,
             zoom: view::Zoom::default(),
             confirm_ffc: false,
             confirm_clear: false,
@@ -385,8 +394,35 @@ impl ThermalApp {
         self.frame = Some(f);
         self.notify(format!("스냅샷 열기: {}", loaded.name));
         webcam::release(self);
+        self.saved_marks = loaded.marks;
         self.hold = Some(Hold::Snapshot(loaded.name));
         self.render();
+    }
+
+    /// The open snapshot's own measurements to draw beside the current ones: none unless a
+    /// snapshot is open and they are switched on, and none that the current ones repeat (same
+    /// place, same kind).
+    pub(super) fn saved_marks_shown(&self) -> SavedMarks {
+        if !self.show_saved_marks || !matches!(self.hold, Some(Hold::Snapshot(_))) {
+            return SavedMarks::default();
+        }
+        let (spots, shapes) = (&self.settings.spots.items, &self.settings.shapes.items);
+        SavedMarks {
+            spots: (self.saved_marks.spots.iter())
+                .filter(|s| !spots.iter().any(|c| (c.x, c.y) == (s.x, s.y)))
+                .copied()
+                .collect(),
+            shapes: (self.saved_marks.shapes.iter())
+                .filter(|s| {
+                    let n = s.normalized();
+                    !shapes.iter().any(|c| {
+                        let c = c.normalized();
+                        (c.kind, c.a, c.b) == (n.kind, n.a, n.b)
+                    })
+                })
+                .copied()
+                .collect(),
+        }
     }
 
     /// CSV, recording and MP4 need frames that keep coming.
@@ -765,6 +801,7 @@ impl ThermalApp {
                 return None;
             }
             let f = self.settings.rotation.apply(self.camera.take_frame()?);
+            let f = self.settings.flip.apply(f);
             self.end_recordings_on_resize(&f);
             if self.seq.as_mut().is_some_and(|w| !w.push(&f)) {
                 // The writer stopped on an error (disk full…); finishing reports it.
@@ -1102,6 +1139,11 @@ impl ThermalApp {
         match snapshot::save(&dir, f, &self.rgba, upscaled, picture, temps, &meta) {
             Ok(files) => {
                 self.notify(format!("저장됨: {}", files.color_png.display()));
+                if self.settings.snapshot_report {
+                    if let Err(e) = self.write_report(&meta, &files) {
+                        self.notify(format!("보고서를 만들 수 없습니다: {e:#}"));
+                    }
+                }
                 if let Some((u, input)) = ai {
                     // Each copy is a separate process on the GPU: a burst of snapshots (a
                     // remote client in a loop) must not stack them up.
@@ -1118,6 +1160,51 @@ impl ThermalApp {
                 Err(format!("snapshot failed: {e}"))
             }
         }
+    }
+
+    /// `<snapshot>_report.html`: the view as the MP4 draws it (measurements, color bar, time),
+    /// the webcam picture and the readings of `meta`.
+    fn write_report(
+        &self,
+        meta: &SnapshotMeta,
+        files: &snapshot::SnapshotFiles,
+    ) -> anyhow::Result<PathBuf> {
+        use crate::video::overlay;
+        let scene = self
+            .video_scene(0.0)
+            .ok_or_else(|| anyhow::anyhow!("no image to draw"))?;
+        let cv = overlay::compose(&scene, &overlay::Text::load());
+        let img = image::RgbImage::from_raw(cv.width as u32, cv.height as u32, cv.rgb)
+            .ok_or_else(|| anyhow::anyhow!("canvas size mismatch"))?;
+        let mut view_png = Vec::new();
+        img.write_to(
+            &mut std::io::Cursor::new(&mut view_png),
+            image::ImageFormat::Png,
+        )?;
+        let webcam_png = match &files.webcam_png {
+            Some(p) => Some(std::fs::read(p)?),
+            None => None,
+        };
+        let base = files
+            .color_png
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let path = report::path_for(&files.color_png);
+        report::write(
+            &path,
+            meta,
+            &report::Extras {
+                view_png: &view_png,
+                webcam_png: webcam_png.as_deref(),
+                calibration: meta
+                    .calibration
+                    .is_some()
+                    .then(|| self.settings.calibration.summary()),
+                base: &base,
+            },
+        )?;
+        Ok(path)
     }
 
     /// The settings panel: foldable sections, each with a one-line summary in its header so
@@ -1348,6 +1435,17 @@ impl ThermalApp {
             .on_hover_text(
                 "스냅샷마다 모든 화소의 온도를 _temps.csv로 함께 저장합니다(영상의 행마다 한 줄). \
                  엑셀 등에서 분석할 때 씁니다",
+            )
+            .changed();
+        changed |= ui
+            .checkbox(
+                &mut self.settings.snapshot_report,
+                "스냅샷에 HTML 보고서 추가",
+            )
+            .on_hover_text(
+                "스냅샷마다 _report.html을 함께 저장합니다: 측정 표시가 있는 영상, 웹캠 사진, \
+                 측정값 표와 촬영 조건이 한 파일에 들어 있어 그대로 보내거나 브라우저에서 PDF로 \
+                 인쇄할 수 있습니다",
             )
             .changed();
         let running = self.timelapse.as_ref().map(|t| t.shots);
@@ -1682,6 +1780,19 @@ impl ThermalApp {
             });
             if rot != self.settings.rotation {
                 let _ = self.set_rotation(rot);
+            }
+            let mut flip = self.settings.flip;
+            ui.add_enabled_ui(can_rotate, |ui| {
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut flip.h, "좌우 뒤집기");
+                    ui.checkbox(&mut flip.v, "상하 뒤집기");
+                })
+                .response
+                .on_hover_text("거울에 비친 모습처럼 뒤집습니다(회전 다음에 적용). 측정점·영역도 함께 옮겨집니다")
+                .on_disabled_hover_text(self.rotation_lock().map_or("", |l| l.0));
+            });
+            if flip != self.settings.flip {
+                let _ = self.set_flip(flip);
             }
             changed |= ui
                 .checkbox(&mut self.settings.upscale.enabled, "4배 업스케일")
@@ -2055,48 +2166,84 @@ impl ThermalApp {
         if self.player.is_some() {
             Some((
                 "재생 중에는 바꿀 수 없습니다(녹화할 때의 방향으로 저장돼 있음)",
-                "a recording is being played back; rotation applies to live video",
+                "a recording is being played back; rotation and flip apply to live video",
             ))
         } else if self.csv.is_some() || self.seq.is_some() || self.video.is_some() {
             Some((
                 "CSV·녹화·MP4 기록 중에는 바꿀 수 없습니다",
-                "rotation cannot change while CSV, REC or MP4 runs",
+                "rotation and flip cannot change while CSV, REC or MP4 runs",
             ))
         } else {
             None
         }
     }
 
-    /// Turn the live image. The current frame and every Spot, Box and Line move with it, so
-    /// measurements stay on the same scene points.
+    /// Turn the live image. The current frame and every Spot, Box, Ellipse and Line move with
+    /// it, so measurements stay on the same scene points.
     pub(super) fn set_rotation(&mut self, new: Rotation) -> Result<(), &'static str> {
         if let Some((_, why)) = self.rotation_lock() {
             return Err(why);
         }
         let step = new.since(self.settings.rotation);
-        if let Some(f) = self.frame.take() {
-            let size = (f.width, f.height);
-            for s in &mut self.settings.spots.items {
-                (s.x, s.y) = step.point((s.x, s.y), size);
-            }
-            for s in &mut self.settings.shapes.items {
-                s.a = step.point(s.a, size);
-                s.b = step.point(s.b, size);
-            }
-            let f = step.apply(f);
-            self.stats = Some(f.stats());
-            self.frame = Some(f);
-        }
-        self.drag = None;
+        // The frame is rotated, then mirrored: undo the mirror, turn, mirror again.
+        let flip = self.settings.flip;
+        self.transform_view(
+            |p, size| {
+                let p = flip.point(p, size);
+                let q = step.point(p, size);
+                flip.point(q, step.size(size))
+            },
+            |f| flip.apply(step.apply(flip.apply(f))),
+        );
         self.settings.rotation = new;
-        // The reference of a difference image was taken the other way up.
+        self.after_transform("영상을 돌려 차이 영상을 껐습니다");
+        Ok(())
+    }
+
+    /// Mirror the live image; measurements move with it, as for [`Self::set_rotation`].
+    pub(super) fn set_flip(&mut self, new: Flip) -> Result<(), &'static str> {
+        if let Some((_, why)) = self.rotation_lock() {
+            return Err(why);
+        }
+        let step = new.since(self.settings.flip);
+        self.transform_view(|p, size| step.point(p, size), |f| step.apply(f));
+        self.settings.flip = new;
+        self.after_transform("영상을 뒤집어 차이 영상을 껐습니다");
+        Ok(())
+    }
+
+    /// Move the current frame and every measurement by one change of orientation. `point`
+    /// maps a pixel of the current frame (given its size); `frame` turns the frame itself.
+    fn transform_view(
+        &mut self,
+        point: impl Fn((usize, usize), (usize, usize)) -> (usize, usize),
+        frame: impl FnOnce(ThermalFrame) -> ThermalFrame,
+    ) {
+        let Some(f) = self.frame.take() else {
+            return;
+        };
+        let size = (f.width, f.height);
+        for s in &mut self.settings.spots.items {
+            (s.x, s.y) = point((s.x, s.y), size);
+        }
+        for s in &mut self.settings.shapes.items {
+            s.a = point(s.a, size);
+            s.b = point(s.b, size);
+        }
+        let f = frame(f);
+        self.stats = Some(f.stats());
+        self.frame = Some(f);
+    }
+
+    fn after_transform(&mut self, diff_ended: &str) {
+        self.drag = None;
+        // The reference of a difference image was taken the other way round.
         if self.diff.is_some() {
             self.end_diff();
-            self.notify("영상을 돌려 차이 영상을 껐습니다");
+            self.notify(diff_ended);
         }
         self.mark_dirty();
         self.render();
-        Ok(())
     }
 
     /// Shutter mode and FFC of the shutterless Lepton.
@@ -2434,6 +2581,11 @@ impl ThermalApp {
                     "╱ 선",
                     "끌기: 선 그리기 · 끝점 끌기: 조절 · 우클릭: 삭제 (3)",
                 ),
+                (
+                    Tool::Ellipse,
+                    "◯ 원",
+                    "끌기: 원·타원 그리기(둘러싼 사각형) · 테두리 끌기: 크기 조절 · 우클릭: 삭제 (4)",
+                ),
             ] {
                 ui.selectable_value(&mut self.tool, tool, text)
                     .on_hover_text(hint);
@@ -2467,6 +2619,14 @@ impl ThermalApp {
                             Hold::Snapshot(name) => format!("🖼 스냅샷 {name}"),
                         },
                     );
+                    if matches!(hold, Hold::Snapshot(_)) && !self.saved_marks.is_empty() {
+                        ui.checkbox(&mut self.show_saved_marks, "찍을 때의 측정")
+                            .on_hover_text(
+                                "스냅샷을 찍을 때 있던 측정점·영역을 주황색 [S1]처럼 함께 \
+                                 보여 줍니다(지금 측정과 같은 것은 한 번만). 값은 이 영상에서 \
+                                 다시 잰 것이고, 고치거나 지울 수 없습니다",
+                            );
+                    }
                     release = ui
                         .small_button("▶ 실시간으로")
                         .on_hover_text("카메라 영상으로 돌아갑니다 (Space)")
@@ -2614,6 +2774,7 @@ impl ThermalApp {
             (Key::Num1, Tool::Spot),
             (Key::Num2, Tool::Box),
             (Key::Num3, Tool::Line),
+            (Key::Num4, Tool::Ellipse),
         ] {
             if key(k) {
                 self.tool = tool;
@@ -2948,6 +3109,110 @@ mod tests {
         let mut f = ThermalFrame::new(w, h, vec![30000; w * h], Some(0.01));
         f.sequence = seq;
         f
+    }
+
+    #[test]
+    fn a_reopened_snapshot_shows_the_measurements_it_was_taken_with() {
+        let dir = std::env::temp_dir().join(format!("thermalview_marks_{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let settings = Settings {
+            snapshot_dir: Some(dir.clone()),
+            ..Default::default()
+        };
+        let mut app = ThermalApp::with_camera(settings, Camera::disconnected());
+        let ctx = egui::Context::default();
+        app.camera.inject(frame_of(160, 120, 1));
+        app.tick(&ctx);
+        let s1 = app.settings.spots.add(10, 10).unwrap();
+        app.settings.spots.add(30, 40);
+        app.settings
+            .shapes
+            .add(ShapeKind::Ellipse, (60, 50), (20, 20));
+        app.settings.shapes.add(ShapeKind::Line, (0, 0), (50, 5));
+        let png = app.take_snapshot(&CameraStatus::default()).unwrap();
+        assert!(
+            app.saved_marks_shown().is_empty(),
+            "only for an open snapshot"
+        );
+
+        // Later: S1 and the line are still there, S2 and the ellipse were deleted.
+        app.settings.spots.items.retain(|s| s.id == s1);
+        app.settings
+            .shapes
+            .items
+            .retain(|s| s.kind == ShapeKind::Line);
+        app.open_snapshot(&png);
+        let shown = app.saved_marks_shown();
+        assert_eq!(
+            shown
+                .spots
+                .iter()
+                .map(|s| (s.id, s.x, s.y))
+                .collect::<Vec<_>>(),
+            vec![(2, 30, 40)]
+        );
+        assert_eq!(shown.shapes.len(), 1);
+        let e = shown.shapes[0];
+        assert_eq!(
+            (e.id, e.kind, e.a, e.b),
+            (1, ShapeKind::Ellipse, (60, 50), (20, 20))
+        );
+        // Drawn without panicking, with the image view.
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            app.upload_texture(ui.ctx());
+            view::image_view(ui, &mut app);
+        });
+        out.textures_delta.clear();
+
+        app.show_saved_marks = false;
+        assert!(app.saved_marks_shown().is_empty());
+        app.show_saved_marks = true;
+        app.set_hold(false).unwrap();
+        assert!(app.saved_marks_shown().is_empty(), "gone with the snapshot");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_snapshot_can_come_with_a_report() {
+        let dir = std::env::temp_dir().join(format!("thermalview_report_{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let settings = Settings {
+            snapshot_dir: Some(dir.clone()),
+            ..Default::default()
+        };
+        let mut app = ThermalApp::with_camera(settings, Camera::disconnected());
+        let ctx = egui::Context::default();
+        app.camera.inject(frame_of(160, 120, 1));
+        app.tick(&ctx);
+        app.settings.spots.add(10, 10);
+        app.settings
+            .shapes
+            .add(ShapeKind::Ellipse, (20, 20), (60, 50));
+        let status = CameraStatus::default();
+        let reports = |dir: &std::path::Path| {
+            std::fs::read_dir(dir)
+                .unwrap()
+                .flatten()
+                .filter(|e| e.file_name().to_string_lossy().ends_with("_report.html"))
+                .map(|e| e.path())
+                .collect::<Vec<_>>()
+        };
+        app.take_snapshot(&status).unwrap();
+        assert!(reports(&dir).is_empty(), "off by default");
+
+        app.settings.snapshot_report = true;
+        let png = app.take_snapshot(&status).unwrap();
+        let report = report::path_for(&png);
+        let page = std::fs::read_to_string(&report).unwrap();
+        assert!(
+            page.contains("data:image/png;base64,iVBOR"),
+            "the view as PNG"
+        );
+        assert!(page.contains("S1 (10, 10)") && page.contains("E1 원"));
+        assert!(page.contains("26.85 °C"));
+        // Opening the report file opens its snapshot.
+        assert!(snapshot::load(&report).is_ok());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Another camera taking over mid-recording (another image size) ends CSV and recording
@@ -3556,6 +3821,66 @@ mod tests {
         press(&ctx, &mut app, egui::Key::D);
         app.set_rotation(Rotation::R180).unwrap();
         assert!(app.diff.is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Mirroring and turning in any order: the measurements stay on their scene points, and
+    /// the next camera frame comes out the same way round as the one already shown.
+    #[test]
+    fn flips_and_turns_keep_measurements_on_their_scene_points() {
+        let dir = temp("flip");
+        let (mut app, ctx) = app_in(&dir);
+        // A warm pixel at (10, 20) and a warmer one at (150, 100).
+        let scene = || {
+            let mut raw = vec![30000u16; 160 * 120];
+            raw[20 * 160 + 10] = 31000;
+            raw[100 * 160 + 150] = 32000;
+            ThermalFrame::new(160, 120, raw, Some(0.01))
+        };
+        app.camera.inject(scene());
+        app.tick(&ctx);
+        let warm = app.settings.spots.add(10, 20).unwrap();
+        app.settings
+            .shapes
+            .add(ShapeKind::Ellipse, (145, 95), (155, 105));
+        let read = |app: &ThermalApp| {
+            let f = app.frame.as_ref().unwrap();
+            let spot = app
+                .settings
+                .spots
+                .items
+                .iter()
+                .find(|s| s.id == warm)
+                .unwrap();
+            let e = app.settings.shapes.items[0].stats(f).unwrap();
+            (f.value(f.at(spot.x, spot.y)), e.max)
+        };
+        let before = read(&app);
+        for (rot, flip) in [
+            (Rotation::R0, Flip { h: true, v: false }),
+            (Rotation::R90, Flip { h: true, v: false }),
+            (Rotation::R90, Flip { h: true, v: true }),
+            (Rotation::R270, Flip { h: false, v: true }),
+            (Rotation::R0, Flip::NONE),
+        ] {
+            if rot != app.settings.rotation {
+                app.set_rotation(rot).unwrap();
+            }
+            if flip != app.settings.flip {
+                app.set_flip(flip).unwrap();
+            }
+            assert_eq!(read(&app), before, "{rot:?} {flip:?}");
+            // A new frame from the camera is turned and mirrored like the shown one.
+            let shown = app.frame.as_ref().unwrap().raw.clone();
+            app.camera.inject(scene());
+            app.tick(&ctx);
+            assert_eq!(app.frame.as_ref().unwrap().raw, shown, "{rot:?} {flip:?}");
+            assert_eq!(read(&app), before);
+        }
+        // Locked while recording, like the rotation.
+        app.start_csv().unwrap();
+        assert!(app.set_flip(Flip { h: true, v: false }).is_err());
+        app.stop_csv().unwrap();
         std::fs::remove_dir_all(&dir).ok();
     }
 

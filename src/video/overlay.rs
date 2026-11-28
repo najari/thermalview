@@ -44,7 +44,13 @@ pub enum Mark {
         b: (usize, usize),
         text: String,
     },
-    /// Hottest pixel of a Box.
+    /// Ellipse inscribed in the box from `a` to `b`.
+    Ellipse {
+        a: (usize, usize),
+        b: (usize, usize),
+        text: String,
+    },
+    /// Hottest pixel of a Box or Ellipse.
     Peak {
         at: (usize, usize),
     },
@@ -300,25 +306,60 @@ impl Text {
         s: &str,
         c: Rgb,
     ) {
+        self.label_avoiding(cv, anchor, offset, bounds, None, s, c);
+    }
+
+    /// [`Self::label`], moved below `avoid` (x0, y0, x1, y1) when it would cover it: the caption
+    /// in the corner must not hide a marker's reading, nor the reading the caption.
+    #[allow(clippy::too_many_arguments)]
+    fn label_avoiding(
+        &self,
+        cv: &mut Canvas,
+        anchor: (i32, i32),
+        offset: (i32, i32),
+        bounds: (i32, i32, i32, i32),
+        avoid: Option<(i32, i32, i32, i32)>,
+        s: &str,
+        c: Rgb,
+    ) {
         let (w, h) = self.size(s);
         if w == 0 {
             return;
         }
-        let mut x = anchor.0 + offset.0;
-        let mut y = anchor.1 + offset.1;
-        if x + w > bounds.2 {
-            x = anchor.0 - offset.0.abs() - w;
-        }
-        if y < bounds.1 {
-            y = anchor.1 + offset.1.abs();
-        }
-        if y + h > bounds.3 {
-            y = anchor.1 - offset.1.abs() - h;
-        }
-        x = x.max(bounds.0);
+        let (x, y) = place(anchor, offset, bounds, avoid, (w, h));
         cv.shade(x - 2, y - 2, x + w + 2, y + h + 2, 160.0 / 255.0);
         self.draw(cv, x, y, s, c);
     }
+}
+
+/// Top-left corner of a `size` label at `anchor + offset`: flipped to the other side of the
+/// anchor where it would leave `bounds`, and moved below `avoid` where its backdrop (2 px
+/// around the text) would cover it.
+fn place(
+    anchor: (i32, i32),
+    offset: (i32, i32),
+    bounds: (i32, i32, i32, i32),
+    avoid: Option<(i32, i32, i32, i32)>,
+    (w, h): (i32, i32),
+) -> (i32, i32) {
+    let mut x = anchor.0 + offset.0;
+    let mut y = anchor.1 + offset.1;
+    if x + w > bounds.2 {
+        x = anchor.0 - offset.0.abs() - w;
+    }
+    if y < bounds.1 {
+        y = anchor.1 + offset.1.abs();
+    }
+    if y + h > bounds.3 {
+        y = anchor.1 - offset.1.abs() - h;
+    }
+    x = x.max(bounds.0);
+    if let Some((ax0, ay0, ax1, ay1)) = avoid {
+        if x - 2 < ax1 && x + w + 2 > ax0 && y - 2 < ay1 && y + h + 2 > ay0 {
+            y = ay1 + 4;
+        }
+    }
+    (x, y)
 }
 
 fn cross(cv: &mut Canvas, c: (i32, i32), r: i32, color: Rgb) {
@@ -361,19 +402,24 @@ pub fn compose(scene: &Scene, text: &Text) -> Canvas {
         )
     };
 
+    // Where the caption goes (top left): marker readings keep out of it.
+    let avoid = (!scene.caption.is_empty())
+        .then(|| text.size(&scene.caption))
+        .filter(|(w, _)| *w > 0)
+        .map(|(w, h)| (4, 2, 6 + w + 2, 4 + h + 2));
     for m in &scene.marks {
         match m {
             Mark::Cross { at, text: s, color } => {
                 let c = center(*at);
                 cross(&mut cv, c, 7, *color);
-                text.label(&mut cv, c, (9, -9), bounds, s, *color);
+                text.label_avoiding(&mut cv, c, (9, -9), bounds, avoid, s, *color);
             }
             Mark::Spot { at, text: s } => {
                 let c = center(*at);
                 let r = (1.5 * SCALE as f32).max(3.0);
                 cv.ring(c, r, 3.0, BLACK);
                 cv.ring(c, r, 1.2, WHITE);
-                text.label(&mut cv, c, (8, 6), bounds, s, WHITE);
+                text.label_avoiding(&mut cv, c, (8, 6), bounds, avoid, s, WHITE);
             }
             Mark::Box { a, b, text: s } => {
                 let x0 = (a.0.min(b.0) * SCALE) as i32;
@@ -386,7 +432,42 @@ pub fn compose(scene: &Scene, text: &Text) -> Canvas {
                     cv.line((x1, y1), (x0, y1), width, col);
                     cv.line((x0, y1), (x0, y0), width, col);
                 }
-                text.label(&mut cv, (x0, y0), (2, -18), bounds, s, SHAPE_COLOR);
+                text.label_avoiding(&mut cv, (x0, y0), (2, -18), bounds, avoid, s, SHAPE_COLOR);
+            }
+            Mark::Ellipse { a, b, text: s } => {
+                let x0 = (a.0.min(b.0) * SCALE) as f32;
+                let y0 = (a.1.min(b.1) * SCALE) as f32;
+                let x1 = ((a.0.max(b.0) + 1) * SCALE) as f32;
+                let y1 = ((a.1.max(b.1) + 1) * SCALE) as f32;
+                let (cx, cy, rx, ry) = (
+                    (x0 + x1) / 2.0,
+                    (y0 + y1) / 2.0,
+                    (x1 - x0) / 2.0,
+                    (y1 - y0) / 2.0,
+                );
+                // A polygon fine enough that its sides do not show (about 4 px each).
+                let n = ((rx + ry) * std::f32::consts::PI / 4.0).clamp(16.0, 256.0) as usize;
+                let at = |i: usize| {
+                    let t = i as f32 / n as f32 * std::f32::consts::TAU;
+                    (
+                        (cx + rx * t.cos()).round() as i32,
+                        (cy + ry * t.sin()).round() as i32,
+                    )
+                };
+                for (width, col) in [(3, BLACK), (1, SHAPE_COLOR)] {
+                    for i in 0..n {
+                        cv.line(at(i), at(i + 1), width, col);
+                    }
+                }
+                text.label_avoiding(
+                    &mut cv,
+                    (x0 as i32, y0 as i32),
+                    (2, -18),
+                    bounds,
+                    avoid,
+                    s,
+                    SHAPE_COLOR,
+                );
             }
             Mark::Line { a, b, text: s } => {
                 let (pa, pb) = (center(*a), center(*b));
@@ -395,7 +476,7 @@ pub fn compose(scene: &Scene, text: &Text) -> Canvas {
                 for p in [pa, pb] {
                     cv.disc(p, 3.0, SHAPE_COLOR);
                 }
-                text.label(&mut cv, pa, (2, -18), bounds, s, SHAPE_COLOR);
+                text.label_avoiding(&mut cv, pa, (2, -18), bounds, avoid, s, SHAPE_COLOR);
             }
             Mark::Peak { at } => cross(&mut cv, center(*at), 4, SHAPE_COLOR),
         }
@@ -820,6 +901,26 @@ mod tests {
     }
 
     #[test]
+    fn readings_keep_out_of_the_caption() {
+        let bounds = (0, 0, 640, 480);
+        let caption = Some((4, 2, 200, 24));
+        // The hottest pixel in the top-left corner: its reading would sit on the caption.
+        let (x, y) = place((52, 20), (9, -9), bounds, caption, (60, 18));
+        assert_eq!((x, y), (61, 28), "below the caption");
+        // Elsewhere nothing changes.
+        assert_eq!(
+            place((300, 200), (9, -9), bounds, caption, (60, 18)),
+            (309, 191)
+        );
+        assert_eq!(place((52, 20), (9, -9), bounds, None, (60, 18)), (61, 11));
+        // Near the right edge it still flips to the left.
+        assert_eq!(
+            place((630, 200), (9, -9), bounds, caption, (60, 18)),
+            (561, 191)
+        );
+    }
+
+    #[test]
     fn markers_are_drawn_around_their_pixel() {
         let mut s = scene();
         s.marks = vec![
@@ -840,6 +941,19 @@ mod tests {
         // Box outline on the outer edge of its pixels: x 40..84, y 400..444.
         assert_eq!(cv.get(60, 400), SHAPE_COLOR);
         assert_eq!(cv.get(84, 420), SHAPE_COLOR);
+
+        // An ellipse in the same box: on the middle of each side, not in the corners.
+        s.marks = vec![Mark::Ellipse {
+            a: (10, 100),
+            b: (20, 110),
+            text: String::new(),
+        }];
+        let cv = compose(&s, &Text::none());
+        for (x, y) in [(62, 400), (84, 422), (62, 444), (40, 422)] {
+            assert_eq!(cv.get(x, y), SHAPE_COLOR, "({x}, {y})");
+        }
+        assert_eq!(cv.get(41, 401), [0, 0, 0], "corner left clear");
+        assert_eq!(cv.get(62, 422), [0, 0, 0], "inside left clear");
     }
 
     #[test]

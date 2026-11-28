@@ -6,6 +6,8 @@ use serde::Serialize;
 
 use crate::thermal::calibration::Calibration;
 use crate::thermal::frame::ThermalFrame;
+use crate::thermal::measure::Spot;
+use crate::thermal::shapes::{Shape, ShapeKind};
 use crate::thermal::upscale::{UpscaleSettings, FACTOR};
 use crate::webcam::blend::Overlay;
 use crate::webcam::Picture;
@@ -178,7 +180,15 @@ pub fn temps_table(frame: &ThermalFrame) -> String {
 }
 
 /// File-name endings of the files of one snapshot, after the common base name.
-const SUFFIXES: [&str; 6] = ["_ai_x4_in", "_ai_x4", "_raw16", "_webcam", "_temps", "_x4"];
+const SUFFIXES: [&str; 7] = [
+    "_ai_x4_in",
+    "_ai_x4",
+    "_raw16",
+    "_webcam",
+    "_temps",
+    "_report",
+    "_x4",
+];
 
 /// A saved snapshot read back.
 #[derive(Debug)]
@@ -187,14 +197,72 @@ pub struct Loaded {
     pub frame: ThermalFrame,
     /// Base name of the snapshot's files.
     pub name: String,
+    /// The measurements placed when it was taken (those that had a value then).
+    pub marks: SavedMarks,
 }
 
-/// The part of the JSON needed to read the 16-bit image as temperatures.
+/// Measurements recorded in a snapshot's JSON, with their original numbers.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SavedMarks {
+    pub spots: Vec<Spot>,
+    pub shapes: Vec<Shape>,
+}
+
+impl SavedMarks {
+    pub fn is_empty(&self) -> bool {
+        self.spots.is_empty() && self.shapes.is_empty()
+    }
+}
+
+/// The part of the JSON needed to read the 16-bit image as temperatures, and to show the
+/// measurements again.
 #[derive(serde::Deserialize)]
 struct SavedMeta {
     kelvin_per_count: Option<f32>,
     #[serde(default)]
     captured_local: String,
+    #[serde(default)]
+    spots: Vec<SavedSpot>,
+    #[serde(default)]
+    shapes: Vec<SavedShape>,
+}
+
+#[derive(serde::Deserialize)]
+struct SavedSpot {
+    id: u32,
+    x: usize,
+    y: usize,
+}
+
+#[derive(serde::Deserialize)]
+struct SavedShape {
+    label: String,
+    kind: String,
+    a: (usize, usize),
+    b: (usize, usize),
+}
+
+impl SavedShape {
+    /// "B2" + "Box" → Box 2. `None` for a kind this version does not know.
+    fn shape(&self) -> Option<Shape> {
+        let kind = match self.kind.as_str() {
+            "Box" => ShapeKind::Box,
+            "Line" => ShapeKind::Line,
+            "Ellipse" => ShapeKind::Ellipse,
+            _ => return None,
+        };
+        let id = self
+            .label
+            .trim_start_matches(|c: char| !c.is_ascii_digit())
+            .parse()
+            .unwrap_or(0);
+        Some(Shape {
+            id,
+            kind,
+            a: self.a,
+            b: self.b,
+        })
+    }
 }
 
 /// Read a snapshot back from any of its files (color PNG, 16-bit PNG, JSON…): the frame comes
@@ -232,7 +300,19 @@ pub fn load(path: &Path) -> anyhow::Result<Loaded> {
     // Unknown time: the same mark as a played-back frame.
     frame.captured = chrono::DateTime::parse_from_rfc3339(&meta.captured_local)
         .map_or(std::time::SystemTime::UNIX_EPOCH, Into::into);
-    Ok(Loaded { frame, name })
+    let marks = SavedMarks {
+        spots: meta
+            .spots
+            .iter()
+            .map(|s| Spot {
+                id: s.id,
+                x: s.x,
+                y: s.y,
+            })
+            .collect(),
+        shapes: meta.shapes.iter().filter_map(SavedShape::shape).collect(),
+    };
+    Ok(Loaded { frame, name, marks })
 }
 
 /// Snapshots in `dir` that can be opened again, as (16-bit PNG, bytes, last change), newest

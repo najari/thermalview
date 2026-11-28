@@ -214,6 +214,11 @@ pub(super) fn execute(app: &mut ThermalApp, status: &CameraStatus, req: Request)
             app.set_rotation(r).map_err(|why| why.to_string())?;
             Ok(proto::rotation_degrees(r).to_string())
         }
+        Request::Flip(None) => Ok(proto::flip_name(app.settings.flip).into()),
+        Request::Flip(Some(f)) => {
+            app.set_flip(f).map_err(|why| why.to_string())?;
+            Ok(proto::flip_name(f).into())
+        }
         Request::Emissivity(None) => Ok(format!("{:.3}", app.settings.calibration.emissivity)),
         Request::Emissivity(Some(e)) => {
             if app.csv.is_some() {

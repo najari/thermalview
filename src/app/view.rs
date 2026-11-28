@@ -6,12 +6,15 @@ use std::time::Instant;
 
 use super::{DragOp, ThermalApp, Tool};
 use crate::thermal::measure::Spots;
+use crate::thermal::range::RangeMode;
 use crate::thermal::shapes::{Shape, ShapeKind, Shapes};
 use crate::webcam::blend::Mode;
 
 const BAR_WIDTH: f32 = 18.0;
 const BAR_LABELS: f32 = 70.0;
 pub(super) const SHAPE_COLOR: Color32 = Color32::from_rgb(120, 255, 120);
+/// Measurements stored with a reopened snapshot.
+const SAVED_COLOR: Color32 = Color32::from_rgb(255, 170, 40);
 /// Marker and reading of the hottest / coldest pixel.
 pub(super) const MAX_COLOR: Color32 = Color32::from_rgb(235, 60, 60);
 pub(super) const MIN_COLOR: Color32 = Color32::from_rgb(60, 140, 240);
@@ -303,20 +306,30 @@ pub(super) fn image_view(ui: &mut egui::Ui, app: &mut ThermalApp) -> bool {
     let draw_shape = |s: &Shape, color: Color32| {
         let shadow = Stroke::new(3.0, Color32::BLACK);
         let line = Stroke::new(1.5, color);
+        let bounds = || {
+            Rect::from_two_pos(
+                pos2(
+                    origin.x + s.a.0.min(s.b.0) as f32 * scale,
+                    origin.y + s.a.1.min(s.b.1) as f32 * scale,
+                ),
+                pos2(
+                    origin.x + (s.a.0.max(s.b.0) + 1) as f32 * scale,
+                    origin.y + (s.a.1.max(s.b.1) + 1) as f32 * scale,
+                ),
+            )
+        };
         match s.kind {
             ShapeKind::Box => {
-                let r = Rect::from_two_pos(
-                    pos2(
-                        origin.x + s.a.0.min(s.b.0) as f32 * scale,
-                        origin.y + s.a.1.min(s.b.1) as f32 * scale,
-                    ),
-                    pos2(
-                        origin.x + (s.a.0.max(s.b.0) + 1) as f32 * scale,
-                        origin.y + (s.a.1.max(s.b.1) + 1) as f32 * scale,
-                    ),
-                );
+                let r = bounds();
                 painter.rect_stroke(r, 0.0, shadow, StrokeKind::Middle);
                 painter.rect_stroke(r, 0.0, line, StrokeKind::Middle);
+                r.left_top()
+            }
+            ShapeKind::Ellipse => {
+                let r = bounds();
+                let radius = r.size() / 2.0;
+                painter.add(egui::Shape::ellipse_stroke(r.center(), radius, shadow));
+                painter.add(egui::Shape::ellipse_stroke(r.center(), radius, line));
                 r.left_top()
             }
             ShapeKind::Line => {
@@ -334,7 +347,7 @@ pub(super) fn image_view(ui: &mut egui::Ui, app: &mut ThermalApp) -> bool {
         let corner = draw_shape(s, SHAPE_COLOR);
         if let Some(st) = s.stats(f) {
             // Where the hottest pixel of an area is.
-            if s.kind == ShapeKind::Box && st.pixels > 1 {
+            if s.kind.is_area() && st.pixels > 1 {
                 let c = to_screen(st.max_pos.0, st.max_pos.1);
                 cross(&painter, c, 4.0, SHAPE_COLOR);
             }
@@ -349,6 +362,46 @@ pub(super) fn image_view(ui: &mut egui::Ui, app: &mut ThermalApp) -> bool {
                 &txt,
                 &font,
                 SHAPE_COLOR,
+            );
+        }
+    }
+
+    // The open snapshot's own measurements, read-only, in their own color.
+    let saved = app.saved_marks_shown();
+    for s in &saved.spots {
+        let c = to_screen(s.x, s.y);
+        if !in_view(c) {
+            continue;
+        }
+        painter.circle_stroke(c, 1.5 * scale.max(3.0), Stroke::new(2.0, Color32::BLACK));
+        painter.circle_stroke(c, 1.5 * scale.max(3.0), Stroke::new(1.0, SAVED_COLOR));
+        let v = s
+            .value(f)
+            .map(|v| format!("[S{}] {v:.1}{unit}", s.id))
+            .unwrap_or_default();
+        label(
+            &painter,
+            c,
+            vec2(8.0, 6.0),
+            img_rect,
+            &v,
+            &font,
+            SAVED_COLOR,
+        );
+    }
+    for s in &saved.shapes {
+        let corner = draw_shape(s, SAVED_COLOR);
+        if let Some(st) = s.stats(f) {
+            let anchor = corner.clamp(img_rect.min, img_rect.max);
+            let txt = format!("[{}] ↑{:.1} ~{:.1}{unit}", s.label(), st.max, st.mean);
+            label(
+                &painter,
+                anchor,
+                vec2(2.0, -18.0),
+                img_rect,
+                &txt,
+                &font,
+                SAVED_COLOR,
             );
         }
     }
@@ -488,7 +541,53 @@ pub(super) fn image_view(ui: &mut egui::Ui, app: &mut ThermalApp) -> bool {
             }
         }
     }
+    changed |= bar_drag(ui, app, bar, resp.id.with("color_bar"));
     changed
+}
+
+/// Dragging the color bar sets a manual range: from the upper half it moves the top, from the
+/// lower half the bottom. A double click returns to the automatic range. Not in a difference
+/// image, whose span is set in the display section.
+fn bar_drag(ui: &egui::Ui, app: &mut ThermalApp, bar: Rect, id: egui::Id) -> bool {
+    if app.diff_stats.is_some() {
+        return false;
+    }
+    let r = ui
+        .interact(bar.expand2(vec2(4.0, 0.0)), id, Sense::click_and_drag())
+        .on_hover_cursor(egui::CursorIcon::ResizeVertical)
+        .on_hover_text(
+            "끌기: 위쪽 절반은 최고, 아래쪽 절반은 최저 온도를 옮김 · 두 번 클릭: 자동 범위",
+        );
+    if r.double_clicked() {
+        let was = app.settings.range;
+        app.settings.range = RangeMode::Auto;
+        app.auto_range.reset();
+        app.render();
+        return was != RangeMode::Auto;
+    }
+    let dy = r.drag_delta().y;
+    if !r.dragged() || dy == 0.0 {
+        return false;
+    }
+    let Some(from) = ui.input(|i| i.pointer.press_origin()) else {
+        return false;
+    };
+    let (lo, hi) = match app.settings.range {
+        RangeMode::Manual { lo, hi } => (lo.min(hi), hi.max(lo)),
+        // Start from what the bar shows now, so nothing jumps.
+        _ => app.display_range,
+    };
+    // Up raises the value, at the scale the bar shows.
+    let dv = -dy / bar.height().max(1.0) * (hi - lo).max(0.1);
+    const GAP: f32 = 0.1;
+    let (lo, hi) = if from.y < bar.center().y {
+        (lo, (hi + dv).max(lo + GAP))
+    } else {
+        ((lo + dv).min(hi - GAP), hi)
+    };
+    app.settings.range = RangeMode::Manual { lo, hi };
+    app.render();
+    true
 }
 
 fn cross(p: &egui::Painter, c: egui::Pos2, r: f32, color: Color32) {
@@ -662,6 +761,54 @@ mod tests {
         let corner = pos2(61.0 * SCALE, 51.0 * SCALE);
         r.drag(corner, corner + vec2(10.0, 5.0) * SCALE);
         assert_eq!(r.shapes(), vec![((20, 20), (70, 55))]);
+    }
+
+    #[test]
+    fn ellipse_tool_draws_resizes_and_deletes() {
+        let mut r = Rig::new();
+        r.app.tool = Tool::Ellipse;
+        r.drag(at(20, 20), at(60, 50));
+        assert_eq!(r.shapes(), vec![((20, 20), (60, 50))]);
+        assert_eq!(r.app.settings.shapes.items[0].kind, ShapeKind::Ellipse);
+        // Its bounding box's right edge resizes it.
+        let edge = pos2(61.0 * SCALE, 35.0 * SCALE);
+        r.drag(edge, edge + vec2(10.0, 0.0) * SCALE);
+        assert_eq!(r.shapes(), vec![((20, 20), (70, 50))]);
+        // A right click in the corner of the box misses the ellipse; in the middle it hits.
+        r.click(at(21, 21), PointerButton::Secondary);
+        assert_eq!(r.shapes().len(), 1);
+        r.click(at(45, 35), PointerButton::Secondary);
+        assert!(r.shapes().is_empty());
+    }
+
+    #[test]
+    fn dragging_the_color_bar_sets_a_manual_range() {
+        let mut r = Rig::new();
+        let (lo0, hi0) = r.app.display_range;
+        assert_eq!(r.app.settings.range, RangeMode::Auto);
+        let x = 160.0 * SCALE + 16.0 + BAR_WIDTH / 2.0;
+        let h = 120.0 * SCALE;
+        // From the upper half, a quarter of the bar up: the top rises by a quarter of the span.
+        r.drag(pos2(x, h * 0.2), pos2(x, h * 0.2 - h / 4.0));
+        let RangeMode::Manual { lo, hi } = r.app.settings.range else {
+            panic!("not manual: {:?}", r.app.settings.range);
+        };
+        assert!((lo - lo0).abs() < 1e-3, "the bottom stays");
+        assert!(hi > hi0 + (hi0 - lo0) * 0.2, "{hi0} -> {hi}");
+        assert_eq!(r.app.display_range, (lo, hi), "the image follows at once");
+        // From the lower half, down: only the bottom moves; it cannot pass the top.
+        r.drag(pos2(x, h * 0.9), pos2(x, h * 0.9 - 4.0 * h));
+        let RangeMode::Manual { lo: lo2, hi: hi2 } = r.app.settings.range else {
+            panic!();
+        };
+        assert_eq!(hi2, hi);
+        assert!((lo2 - (hi - 0.1)).abs() < 1e-3, "{lo2}");
+        // A double click goes back to the automatic range.
+        r.click(pos2(x, h * 0.5), PointerButton::Primary);
+        r.click(pos2(x, h * 0.5), PointerButton::Primary);
+        assert_eq!(r.app.settings.range, RangeMode::Auto);
+        // The image itself is not affected by drags on the bar.
+        assert!(r.shapes().is_empty() && r.spots().is_empty());
     }
 
     #[test]

@@ -1,5 +1,6 @@
-//! Rotating the thermal image in 90° steps, applied to live frames as they arrive so that the
-//! view, measurements, recordings and snapshots all use the turned image.
+//! Rotating the thermal image in 90° steps and mirroring it, applied to live frames as they
+//! arrive (rotation first, then mirroring) so that the view, measurements, recordings and
+//! snapshots all use the turned image.
 
 use serde::{Deserialize, Serialize};
 
@@ -82,9 +83,97 @@ impl Rotation {
     }
 }
 
+/// Mirroring, applied after the rotation: left↔right (`h`) and top↔bottom (`v`). Each is its
+/// own inverse and the two commute, so the step between two settings is their difference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Flip {
+    pub h: bool,
+    pub v: bool,
+}
+
+impl Flip {
+    pub const NONE: Flip = Flip { h: false, v: false };
+
+    pub fn is_none(self) -> bool {
+        self == Self::NONE
+    }
+
+    pub fn label(self) -> &'static str {
+        match (self.h, self.v) {
+            (false, false) => "뒤집지 않음",
+            (true, false) => "좌우",
+            (false, true) => "상하",
+            (true, true) => "좌우·상하",
+        }
+    }
+
+    /// The flip that turns an image flipped by `from` into one flipped by `self`.
+    pub fn since(self, from: Flip) -> Flip {
+        Flip {
+            h: self.h != from.h,
+            v: self.v != from.v,
+        }
+    }
+
+    /// Where pixel (x, y) of a w × h image ends up (the size does not change).
+    pub fn point(self, (x, y): (usize, usize), (w, h): (usize, usize)) -> (usize, usize) {
+        let (x, y) = (x.min(w.saturating_sub(1)), y.min(h.saturating_sub(1)));
+        (
+            if self.h { w - 1 - x } else { x },
+            if self.v { h - 1 - y } else { y },
+        )
+    }
+
+    pub fn apply(self, f: ThermalFrame) -> ThermalFrame {
+        if self.is_none() || f.raw.len() != f.width * f.height {
+            return f;
+        }
+        let size = (f.width, f.height);
+        let mut raw = vec![0u16; f.raw.len()];
+        for y in 0..f.height {
+            for x in 0..f.width {
+                let (nx, ny) = self.point((x, y), size);
+                raw[ny * f.width + nx] = f.raw[y * f.width + x];
+            }
+        }
+        ThermalFrame { raw, ..f }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn flips_mirror_and_undo_themselves() {
+        // 1 2 3      3 2 1      4 5 6
+        // 4 5 6  h→  6 5 4  v→  1 2 3
+        let h = Flip { h: true, v: false };
+        let v = Flip { h: false, v: true };
+        assert_eq!(h.apply(frame()).raw, vec![3, 2, 1, 6, 5, 4]);
+        assert_eq!(v.apply(frame()).raw, vec![4, 5, 6, 1, 2, 3]);
+        let hv = Flip { h: true, v: true };
+        // Both = a half turn.
+        assert_eq!(hv.apply(frame()).raw, Rotation::R180.apply(frame()).raw);
+        for a in [Flip::NONE, h, v, hv] {
+            assert_eq!(a.apply(a.apply(frame())).raw, frame().raw, "{a:?} twice");
+            let flipped = a.apply(frame());
+            for y in 0..2 {
+                for x in 0..3 {
+                    let (nx, ny) = a.point((x, y), (3, 2));
+                    assert_eq!(flipped.at(nx, ny), frame().at(x, y));
+                }
+            }
+            for from in [Flip::NONE, h, v, hv] {
+                let two = a.since(from).apply(from.apply(frame()));
+                assert_eq!(two.raw, flipped.raw, "{from:?} → {a:?}");
+            }
+        }
+        assert_eq!(Flip::default(), Flip::NONE);
+        let old: Flip = serde_json::from_str("{}").unwrap();
+        assert!(old.is_none());
+    }
 
     /// 3 × 2 image:
     /// 1 2 3

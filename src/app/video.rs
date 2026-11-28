@@ -136,11 +136,16 @@ impl ThermalApp {
             let text = stats
                 .map(|st| format!("{} ↑{:.1} ~{:.1}{unit}", s.label(), st.max, st.mean))
                 .unwrap_or_default();
-            if let Some(st) = stats.filter(|st| s.kind == ShapeKind::Box && st.pixels > 1) {
+            if let Some(st) = stats.filter(|st| s.kind.is_area() && st.pixels > 1) {
                 marks.push(Mark::Peak { at: st.max_pos });
             }
             marks.push(match s.kind {
                 ShapeKind::Box => Mark::Box {
+                    a: s.a,
+                    b: s.b,
+                    text,
+                },
+                ShapeKind::Ellipse => Mark::Ellipse {
                     a: s.a,
                     b: s.b,
                     text,

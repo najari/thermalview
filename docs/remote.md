@@ -29,7 +29,7 @@
 | --- | --- | --- |
 | `HELP` | `OK commands: ...` | 명령 목록 |
 | `STATUS` | `OK state=streaming fps=8.9 frames=1234 fpa=31.00 unit=C source=live csv=off rec=off mp4=off cal=off alarms=0` | 연결 상태(`starting`, `searching`, `busy`, `streaming`, `stalled`, `replug`), 초당 프레임, 받은 프레임 수, 센서 온도, 영상 출처(`live`, `playback`, `frozen` = 화면 정지, `snapshot` = 다시 연 스냅샷), CSV·녹화·MP4·보정 여부, 발생 중인 경보 수 |
-| `MEAS` | `OK seq=170 time=2026-11-25T10:04:16.856+09:00 unit=C max=42.51 min=29.56 mean=33.45 center=33.59 maxpos=3,79 minpos=0,1 S1=33.59 B2.max=... B2.min=... B2.mean=...` | 현재 프레임의 최고·최저·평균·중앙(3×3 평균), 최고·최저 위치, 측정점 `S<id>`, 영역·선 `B<id>`/`L<id>`의 최고·최저·평균 |
+| `MEAS` | `OK seq=170 time=2026-11-25T10:04:16.856+09:00 unit=C max=42.51 min=29.56 mean=33.45 center=33.59 maxpos=3,79 minpos=0,1 S1=33.59 B2.max=... B2.min=... B2.mean=... E3.max=...` | 현재 프레임의 최고·최저·평균·중앙(3×3 평균), 최고·최저 위치, 측정점 `S<id>`, 영역·선 `B<id>`/`L<id>`의 최고·최저·평균 |
 | `TEMP x y` | `OK 33.59` | 화소 (x, y) 주변 3×3 평균. x는 0~159, y는 0~119 |
 | `SPOT` 또는 `SPOT LIST` | `OK S1=80,60 S3=10,20` | 측정점 목록 |
 | `SPOT ADD x y` | `OK id=4` | 측정점 추가(최대 16개) |
@@ -48,6 +48,7 @@
 | `FREEZE ON` / `FREEZE OFF` | `OK on` | 지금 프레임을 붙잡아 둠 / 실시간으로 돌아감. 정지 동안 카메라 프레임은 버려지고 `MEAS`·`TEMP`·`FRAME`·`SNAPSHOT`은 붙잡은 프레임을 대상으로 함. CSV·녹화·MP4 기록 중이거나 재생 중에는 `ERR`, 정지 중 `CSV START`·`REC START`·`MP4 START`도 `ERR`. 경보 감시는 정지 동안 중단(`ALARMS`의 `monitoring=frozen`). 다시 연 스냅샷에서 `FREEZE OFF`를 보내면 스냅샷을 닫고 실시간으로 돌아감 |
 | `ZOOM [배율 [x y]]` | `OK 2.50 center=110,80` | 영상 보기의 확대 배율(1~8)과 화면 가운데의 화소. `x y`를 주면 그 화소를 가운데로(가장자리에서는 영상 끝에 맞춤). 화면에만 적용되고 스냅샷·MP4는 항상 전체 영상 |
 | `ROTATE [도]` | `OK 90` | 실시간 영상 회전 읽기·바꾸기(시계 방향 0, 90, 180, 270). 측정점·영역도 같은 장면 위치로 옮겨짐. 재생 중과 CSV·녹화·MP4 기록 중에는 바꿀 수 없음 |
+| `FLIP [NONE\|H\|V\|HV]` | `OK H` | 실시간 영상 뒤집기 읽기·바꾸기: 없음, 좌우(`H`), 상하(`V`), 둘 다(`HV`). 회전 다음에 적용. 측정점·영역도 같은 장면 위치로 옮겨짐. 재생 중과 CSV·녹화·MP4 기록 중에는 바꿀 수 없음 |
 | `EMISSIVITY [e]` | `OK 0.950` | 방사율 읽기·바꾸기(0.10~1.00). CSV 기록 중에는 바꿀 수 없음 |
 | `ALARMS` | `OK enabled=on monitoring=on R1=active R2=clear` | 경보 감시 상태(`on`, `playback`, `frozen`, `nosignal`, `counts`)와 규칙별 상태(`active`, `pending`, `clear`, `off`). 경보가 시작한 MP4가 녹화 중이면 `mp4=alarm`이 붙음(멈추는 것은 `MP4 STOP`으로 직접 해도 됨) |
 | `SNAPSHOT` | `OK C:\...\thermal_20261125_100417_368.png` | 스냅샷 저장(컬러 PNG, 16비트 PNG, JSON). 컬러 PNG 경로를 돌려줌 |

@@ -14,7 +14,7 @@ use crate::thermal::isotherm::Isotherm;
 use crate::thermal::measure::Spots;
 use crate::thermal::palette::Palette;
 use crate::thermal::range::RangeMode;
-use crate::thermal::rotate::Rotation;
+use crate::thermal::rotate::{Flip, Rotation};
 use crate::thermal::shapes::Shapes;
 use crate::thermal::upscale::UpscaleSettings;
 use crate::webcam::blend::Overlay;
@@ -47,11 +47,15 @@ pub struct Settings {
     pub show_extremes: bool,
     /// Clockwise turn applied to live frames.
     pub rotation: Rotation,
+    /// Mirroring applied after the rotation.
+    pub flip: Flip,
     /// 4× display upscaling (view, MP4, extra snapshot image).
     pub upscale: UpscaleSettings,
     pub snapshot_dir: Option<PathBuf>,
     /// Add the temperature of every pixel (`_temps.csv`) to each snapshot.
     pub snapshot_temps_csv: bool,
+    /// Add a one-page HTML report (`_report.html`) to each snapshot.
+    pub snapshot_report: bool,
     /// Seconds between CSV rows; 0 logs every frame.
     pub csv_interval_s: f32,
     /// Seconds between the snapshots of an interval series.
@@ -151,9 +155,11 @@ impl Default for Settings {
             calibration: Calibration::default(),
             show_extremes: true,
             rotation: Rotation::default(),
+            flip: Flip::default(),
             upscale: UpscaleSettings::default(),
             snapshot_dir: None,
             snapshot_temps_csv: false,
+            snapshot_report: false,
             csv_interval_s: 0.0,
             timelapse_s: 10,
             remote: RemoteSettings::default(),
